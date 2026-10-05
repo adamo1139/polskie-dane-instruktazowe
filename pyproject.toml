@@ -1,0 +1,20 @@
+[project]
+name = "polskie-dane-instruktazowe"
+version = "0.1.0"
+description = "Generacja polskich danych instruktażowych (Magpie na Muse Glimmer)"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.9",
+    "aiolimiter>=1.1",
+]
+
+[project.scripts]
+magpie-generate = "magpie.generate:main"
+magpie-verify = "magpie.verify:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["magpie"]

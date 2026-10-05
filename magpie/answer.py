@@ -19,11 +19,12 @@ import json
 import os
 import re
 import time
-from collections import Counter
+from collections import Counter, deque
 
 import aiohttp
 from aiolimiter import AsyncLimiter
 
+SPEED_WINDOW = 300  # s — prędkość i ETA z ostatnich 5 minut, nie średnia od startu
 THINK = re.compile(r"^\s*<think>(.*?)</think>\s*", re.DOTALL)
 
 
@@ -120,6 +121,7 @@ async def run(args: argparse.Namespace, rows: list[dict], out_path: str) -> None
     stats: Counter = Counter()
     buffer: list[dict] = []
     t0 = time.monotonic()
+    recent: deque = deque()  # czasy ukończenia odpowiedzi z ostatnich SPEED_WINDOW sekund
     fout = open(out_path, "a", encoding="utf-8")
 
     def flush() -> None:
@@ -131,10 +133,13 @@ async def run(args: argparse.Namespace, rows: list[dict], out_path: str) -> None
 
     def progress() -> None:
         n = stats["done"]
-        speed = n / max(time.monotonic() - t0, 1e-9)
+        now = time.monotonic()
+        while recent and recent[0] < now - SPEED_WINDOW:
+            recent.popleft()
+        speed = len(recent) / max(min(SPEED_WINDOW, now - t0), 1e-9)
         print(f"{n}/{len(rows)}  ok {stats['ok']}  ucięte/puste {stats['ucięte/puste']}  "
               f"błędy {stats['error']}  timeouty {stats['timeout']}  http {stats['http_err']}  "
-              f"{speed:.2f} odp/s  ETA {(len(rows) - n) / max(speed, 1e-9) / 60:.0f} min", flush=True)
+              f"{speed:.2f} odp/s (ost. 5 min)  ETA {(len(rows) - n) / max(speed, 1e-9) / 60:.0f} min", flush=True)
 
     async def worker(session: aiohttp.ClientSession) -> None:
         while True:
@@ -146,6 +151,7 @@ async def run(args: argparse.Namespace, rows: list[dict], out_path: str) -> None
                 pass  # limiter ogranicza tylko tempo startów; slot trzyma worker
             buffer.append(await work(session, args, row, stats))
             stats["done"] += 1
+            recent.append(time.monotonic())
             if len(buffer) >= args.flush_every:
                 flush()
             if stats["done"] % args.progress_every == 0:

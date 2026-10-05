@@ -27,6 +27,13 @@ warianty wizyjne pominięte, gdy jest odpowiednik tekstowy. Razem 45 modeli.
   (rozumowanie bywa mieszane, np. angielskie myślenie z polskimi cytatami),
 - 45 modeli × 6 pytań × 2 warianty = 540 zapytań, koszt łącznie **1,27 $**, 0 błędów.
 
+## Odpowiedzi modeli
+
+Surowe odpowiedzi są w `odpowiedzi/<dostawca>_<model>/odpowiedzi.jsonl` — jeden folder na model
+(ID z OpenRoutera, `/` i `:` zamienione na `_`, np. `odpowiedzi/qwen_qwen3-8b/`,
+`odpowiedzi/cohere_north-mini-code_free/`). Każdy plik ma 12 wierszy (6 pytań × 2 warianty) z polami:
+`model`, `prompt` (id pytania), `variant` (`bez_systemu` / `system_pl`), `reasoning`, `content`,
+`finish`, `provider`, `reasoning_tokens`, `completion_tokens`, `cost`, `latency_s`.
 
 ## Wyniki
 

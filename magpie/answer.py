@@ -3,8 +3,11 @@
 Wejście: verified.jsonl z magpie.verify (bierzemy verdict == "ok") albo accepted.jsonl z
 magpie.generate (ok == True). Zapytania idą do /v1/chat/completions (vLLM i SGLang) ze streamingiem.
 
-Rozumowanie: --thinking off|on → chat_template_kwargs.enable_thinking. Rozumowanie zapisujemy
-osobno: z pola reasoning_content (gdy serwer ma parser reasoningu) albo z <think>…</think> w treści.
+Rozumowanie: --thinking off|on → zmienna szablonu enable_thinking (albo dowolne --template-kwargs,
+np. {"reasoning_effort": "high"} dla Mistrala Small 4). --backend vllm wysyła je w chat_template_kwargs,
+--backend tabby (TabbyAPI/exl3) w template_vars. Rozumowanie zapisujemy osobno: z pola
+reasoning_content (gdy serwer ma parser reasoningu) albo z <think>…</think> / [THINK]…[/THINK] w treści.
+Prompt systemowy (--system) służy do generowania i domyślnie nie trafia do sft.jsonl (--system-in-sft).
 
 Timeouty: --ttft-timeout (pierwszy fragment), --chunk-timeout (przerwa w strumieniu),
 --total-timeout (całe zapytanie). Wznowienie = ten sam wiersz poleceń; gotowe id są pomijane.
@@ -24,8 +27,12 @@ from collections import Counter, deque
 import aiohttp
 from aiolimiter import AsyncLimiter
 
+# Domyślny prompt systemowy przy --thinking on: bez niego modele zwykle myślą po angielsku.
+SYSTEM_PL_REASONING = ("Jesteś pomocnym asystentem. Zanim odpowiesz, przemyśl problem krok po kroku. "
+                       "Całe rozumowanie prowadź wyłącznie po polsku, a odpowiedź również napisz po polsku.")
 SPEED_WINDOW = 300  # s — prędkość i ETA z ostatnich 5 minut, nie średnia od startu
-THINK = re.compile(r"^\s*<think>(.*?)</think>\s*", re.DOTALL)
+LEFTOVER_THINK = re.compile(r"\[/?THINK\]|</?think>")
+THINK = re.compile(r"^\s*(?:<think>(.*?)</think>|\[THINK\](.*?)\[/THINK\])\s*", re.DOTALL)
 
 
 class StreamTimeout(Exception):
@@ -36,7 +43,7 @@ def split_reasoning(content: str, reasoning: str) -> tuple[str, str]:
     # Bez parsera reasoningu po stronie serwera rozumowanie przychodzi w treści jako <think>…</think>.
     m = THINK.match(content)
     if m:
-        reasoning = reasoning or m[1].strip()
+        reasoning = reasoning or (m[1] if m[1] is not None else m[2]).strip()
         content = content[m.end():]
     return content.strip(), reasoning.strip()
 
@@ -50,17 +57,30 @@ async def chat(session: aiohttp.ClientSession, args: argparse.Namespace, row: di
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
         "top_p": args.top_p,
-        "stream": True,
-        "chat_template_kwargs": {"enable_thinking": args.thinking == "on"},
+        "stream": not args.no_stream,
     }
+    if args.template_kwargs:
+        payload["template_vars" if args.backend == "tabby" else "chat_template_kwargs"] = args.template_kwargs
+    if args.reasoning_effort:
+        payload["reasoning_effort"] = args.reasoning_effort
     t0 = time.monotonic()
     ttft = None
     content, reasoning = [], []
     finish = None
     async with asyncio.timeout(args.total_timeout):
-        async with session.post(f"{args.url}/chat/completions", json=payload) as resp:
+        async with session.post(f"{args.url}/chat/completions", json=payload, headers=args.headers) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"HTTP {resp.status}: {(await resp.text())[:200]}")
+            if args.no_stream:
+                body = await resp.json()
+                choice = body["choices"][0]
+                msg = choice.get("message") or {}
+                content.append(msg.get("content") or "")
+                reasoning.append(msg.get("reasoning_content") or msg.get("reasoning") or "")
+                finish = choice.get("finish_reason")
+                answer, thought = split_reasoning("".join(content), "".join(reasoning))
+                return {"answer": answer, "reasoning": thought, "finish": finish,
+                        "ttft_s": None, "latency_s": round(time.monotonic() - t0, 2)}
             buf = b""
             while True:
                 limit = args.ttft_timeout if ttft is None else args.chunk_timeout
@@ -93,13 +113,17 @@ async def chat(session: aiohttp.ClientSession, args: argparse.Namespace, row: di
 
 async def work(session: aiohttp.ClientSession, args: argparse.Namespace, row: dict, stats: Counter) -> dict:
     base = {k: row[k] for k in ("id", "raw", "topic", "persona", "subtopics") if k in row}
-    base.update(model=args.model, thinking=args.thinking)
+    base.update(model=args.model, thinking=args.thinking, template_kwargs=args.template_kwargs,
+                reasoning_effort=args.reasoning_effort)
     last_err = None
     for attempt in range(args.retries + 1):
         try:
             out = await chat(session, args, row)
-            ok = out["finish"] == "stop" and bool(out["answer"])
-            stats["ok" if ok else "ucięte/puste"] += 1
+            # Niezamknięty blok rozumowania (np. [THINK] bez [/THINK]) — nie da się oddzielić myślenia od odpowiedzi.
+            unclosed = bool(LEFTOVER_THINK.search(out["answer"]))
+            ok = out["finish"] == "stop" and bool(out["answer"]) and not unclosed
+            out["unclosed_reasoning"] = unclosed
+            stats["ok" if ok else ("niezamknięte rozumowanie" if unclosed else "ucięte/puste")] += 1
             return {**base, **out, "ok": ok, "attempts": attempt + 1}
         except (StreamTimeout, TimeoutError) as e:
             stats["timeout"] += 1
@@ -138,6 +162,7 @@ async def run(args: argparse.Namespace, rows: list[dict], out_path: str) -> None
             recent.popleft()
         speed = len(recent) / max(min(SPEED_WINDOW, now - t0), 1e-9)
         print(f"{n}/{len(rows)}  ok {stats['ok']}  ucięte/puste {stats['ucięte/puste']}  "
+              f"niezamknięte rozum. {stats['niezamknięte rozumowanie']}  "
               f"błędy {stats['error']}  timeouty {stats['timeout']}  http {stats['http_err']}  "
               f"{speed:.2f} odp/s (ost. 5 min)  ETA {(len(rows) - n) / max(speed, 1e-9) / 60:.0f} min", flush=True)
 
@@ -168,7 +193,7 @@ async def run(args: argparse.Namespace, rows: list[dict], out_path: str) -> None
         progress()
 
 
-def finalize(out_dir: str, system: str | None) -> None:
+def finalize(out_dir: str, system: str | None = None) -> None:
     rows = {}
     with open(os.path.join(out_dir, "answers.jsonl"), encoding="utf-8") as f:
         for line in f:
@@ -185,7 +210,9 @@ def finalize(out_dir: str, system: str | None) -> None:
             messages = ([{"role": "system", "content": system}] if system else []) + \
                        [{"role": "user", "content": r["raw"]}, assistant]
             f.write(json.dumps({"id": r["id"], "messages": messages,
-                                "meta": {k: r.get(k) for k in ("topic", "persona", "model", "thinking")}},
+                                "meta": {k: r.get(k) for k in ("topic", "persona", "model", "thinking",
+                                                               "template_kwargs", "reasoning_effort")
+                                         if r.get(k) is not None}},
                                ensure_ascii=False) + "\n")
     finish = Counter(r["finish"] for r in rows.values())
     print(f"\nodpowiedzi: {len(rows)}  do sft.jsonl: {len(good)}  finish_reason: {dict(finish)}  "
@@ -199,29 +226,52 @@ def main() -> None:
     p.add_argument("--input", required=True, help="verified.jsonl z magpie.verify albo accepted.jsonl")
     p.add_argument("--out", required=True, help="katalog wynikowy")
     p.add_argument("--thinking", choices=["off", "on"], default="off")
-    p.add_argument("--system", default=None, help="opcjonalny prompt systemowy")
+    p.add_argument("--backend", choices=["vllm", "tabby"], default="vllm",
+                   help="vllm: chat_template_kwargs; tabby (TabbyAPI/exl3): template_vars")
+    p.add_argument("--template-kwargs", default=None,
+                   help='zmienne szablonu jako JSON, np. \'{"reasoning_effort": "high"}\' '
+                        '(domyślnie {"enable_thinking": <thinking>})')
+    p.add_argument("--reasoning-effort", default=None,
+                   help="pole reasoning_effort w zapytaniu (np. high) — dla vLLM z tokenizerem Mistrala, który "
+                        "odrzuca chat_template_kwargs; wtedy zmienne szablonu wysyłane tylko z --template-kwargs")
+    p.add_argument("--no-stream", action="store_true",
+                   help="zapytania bez streamingu — vLLM z tokenizerem Mistrala psuje w strumieniu tokeny "
+                        "[THINK]/[/THINK] (np. „fony”, „</analysis>”); bez streamingu przychodzą poprawnie")
+    p.add_argument("--api-key", default=None, help="klucz API (nagłówek Authorization: Bearer)")
+    p.add_argument("--system", default=None,
+                   help="prompt systemowy do generowania (domyślnie przy --thinking on: SYSTEM_PL_REASONING, "
+                        "„none” = bez promptu)")
+    p.add_argument("--system-in-sft", action="store_true", help="zapisz prompt systemowy w sft.jsonl")
     p.add_argument("--limit", type=int, default=0, help="tylko pierwsze N pytań (0 = wszystkie)")
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top-p", type=float, default=0.95)
-    p.add_argument("--max-tokens", type=int, default=None, help="domyślnie 5000 (off) / 16384 (on)")
+    p.add_argument("--max-tokens", type=int, default=None, help="domyślnie 5000 (off) / 6000 (on) — prompt + odpowiedź muszą zmieścić się w kontekście serwera")
     p.add_argument("--concurrency", type=int, default=500)
     p.add_argument("--rate", type=float, default=100, help="maks. startów zapytań na sekundę")
     p.add_argument("--retries", type=int, default=2)
-    p.add_argument("--ttft-timeout", type=float, default=300)
-    p.add_argument("--chunk-timeout", type=float, default=120)
-    p.add_argument("--total-timeout", type=float, default=1800)
+    p.add_argument("--ttft-timeout", type=float, default=7200, help="czekanie na pierwszy token — obejmuje kolejkę serwera")
+    p.add_argument("--chunk-timeout", type=float, default=3600, help="maks. przerwa w strumieniu — obejmuje wywłaszczenie z KV cache")
+    p.add_argument("--total-timeout", type=float, default=14400)
     p.add_argument("--flush-every", type=int, default=100)
-    p.add_argument("--progress-every", type=int, default=200)
+    p.add_argument("--progress-every", type=int, default=50)
     p.add_argument("--finalize-only", action="store_true")
     args = p.parse_args()
     args.url = args.url.rstrip("/")
     if args.max_tokens is None:
-        args.max_tokens = 16384 if args.thinking == "on" else 5000
+        args.max_tokens = 6000 if args.thinking == "on" else 5000
+    if args.system is None and args.thinking == "on":
+        args.system = SYSTEM_PL_REASONING
+    elif args.system == "none":
+        args.system = None
+    args.template_kwargs = (json.loads(args.template_kwargs) if args.template_kwargs
+                            else None if args.reasoning_effort else {"enable_thinking": args.thinking == "on"})
+    args.headers = {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
+    sft_system = args.system if args.system_in_sft else None
 
     os.makedirs(args.out, exist_ok=True)
     out_path = os.path.join(args.out, "answers.jsonl")
     if args.finalize_only:
-        finalize(args.out, args.system)
+        finalize(args.out, sft_system)
         return
 
     with open(args.input, encoding="utf-8") as f:
@@ -236,14 +286,16 @@ def main() -> None:
 
     if args.model is None and todo:
         async def first_model() -> str:
-            async with aiohttp.ClientSession() as s, s.get(f"{args.url}/models") as resp:
+            async with aiohttp.ClientSession() as s, s.get(f"{args.url}/models", headers=args.headers) as resp:
                 return (await resp.json())["data"][0]["id"]
         args.model = asyncio.run(first_model())
     print(f"pytań: {len(rows)}, gotowych: {len(done)}, do zrobienia: {len(todo)}  (model {args.model}, "
-          f"thinking {args.thinking}, max_tokens {args.max_tokens}, concurrency {args.concurrency})", flush=True)
+          f"thinking {args.thinking}, {args.backend}: szablon {args.template_kwargs}, reasoning_effort "
+          f"{args.reasoning_effort}, max_tokens {args.max_tokens}, "
+          f"concurrency {args.concurrency})", flush=True)
     if todo:
         asyncio.run(run(args, todo, out_path))
-    finalize(args.out, args.system)
+    finalize(args.out, sft_system)
 
 
 if __name__ == "__main__":

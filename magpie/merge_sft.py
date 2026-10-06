@@ -2,7 +2,7 @@
 
 id każdego wiersza = SHA256 treści wiadomości użytkownika (id z poszczególnych runów to numery
 zadań albo hashe i mogą się różnić typem). Przy duplikacie zostaje pierwsze wystąpienie w kolejności
---inputs; source / source_id mówią, skąd pochodzi. Potem tasowanie z --seed.
+--inputs. meta.model skracane do nazwy bez ścieżki. Potem tasowanie z --seed.
 """
 import argparse
 import hashlib
@@ -33,7 +33,10 @@ def main() -> None:
                     stats["duplikat"] += 1
                     continue
                 seen.add(h)
-                merged.append({**r, "id": h, "source": source, "source_id": r["id"]})
+                row = {k: v for k, v in r.items() if k not in ("source", "source_id")}
+                if row.get("meta", {}).get("model"):
+                    row["meta"] = {**row["meta"], "model": os.path.basename(row["meta"]["model"])}
+                merged.append({**row, "id": h})
                 stats[source] += 1
 
     random.Random(args.seed).shuffle(merged)

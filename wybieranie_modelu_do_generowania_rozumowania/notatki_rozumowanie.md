@@ -50,6 +50,7 @@ zwraca tej liczby).
 | mistralai/mistral-small-2603 | 12/12 | 12 | 66% / 100% | 95% | 475 | 0.0124 |
 | minimax/minimax-m2.7 | 12/12 | 12 | 20% / 100% | 99% | 480 | 0.0275 |
 | deepseek/deepseek-v4-flash | 12/12 | 12 | 79% / 100% | 100% | 352 | 0.0032 |
+| deepseek/deepseek-v3.2 | 12/12 | 9 | 84% / 100% | 100% | 319 | 0.0093 |
 | cohere/north-mini-code:free | 12/12 | 12 | 8% / 100% | 100% | 303 | 0.0000 |
 | cohere/command-a-plus | 12/12 | 12 | 5% / 100% | 99% | 326 | 0.0343 |
 | mistralai/mistral-medium-3-5 | 12/12 | 12 | 100% / 99% | 96% | 858 | 0.2217 |
@@ -92,13 +93,14 @@ zwraca tej liczby).
 
 ## Wnioski (z miar automatycznych — jakości merytorycznej jeszcze nie oceniano)
 
-- **Polski prompt systemowy zmienia wszystko u części modeli i nic u reszty.** 9 modeli rozumuje
+- **Polski prompt systemowy zmienia wszystko u części modeli i nic u reszty.** 10 modeli rozumuje
   po polsku w ~100% z promptem (GLM-4.5-Air, Step-3.7-Flash, Laguna-XS-2.1, Mistral Small 4,
-  MiniMax-M2.7, DeepSeek-V4-Flash, North-Mini-Code, Command A Plus, Mistral Medium 3.5), choć bez
-  niego większość z nich myśli po angielsku (np. Laguna-XS 5% → 100%, Command A Plus 5% → 100%).
+  MiniMax-M2.7, DeepSeek-V4-Flash, DeepSeek-V3.2, North-Mini-Code, Command A Plus,
+  Mistral Medium 3.5), choć bez niego większość z nich myśli po angielsku (np. Laguna-XS 5% → 100%,
+  Command A Plus 5% → 100%).
   Pozostałe ignorują instrukcję — rozumowanie zostaje angielskie niezależnie od promptu.
 - **Po polsku bez żadnej instrukcji:** Step-3.7-Flash (100%), Mistral Medium 3.5 (100%),
-  Ternary-Bonsai-2-27B (92%), DeepSeek-V4-Flash (79%).
+  Ternary-Bonsai-2-27B (92%), DeepSeek-V3.2 (84%), DeepSeek-V4-Flash (79%).
 - **Rodzina Qwen (poza Qwen3.8) i gpt-oss praktycznie zawsze myślą po angielsku**; Qwen3/Qwen3-30B
   i Nemotron Nano mają 0–11% polskiego w obu wariantach. Muse Glimmer potwierdza wcześniejszy test (24–30%).
 - **Mali kandydaci (≤ ~40B) z polskim rozumowaniem:**
@@ -115,6 +117,33 @@ zwraca tej liczby).
 - Ograniczenia: 6 pytań × 2 warianty na model to mała próba; „100% polskiego” mówi tylko o języku
   (OpenLID), nie o jakości ani poprawności. Prefill rozumowania (który u Bielika był konieczny)
   przez API czatu OpenRoutera nie był testowany.
+
+## DeepSeek V3.2 (dodane 2026-10-07)
+
+Domierzony tą samą metodą po zamknięciu pierwszej serii, więc liczby 45 modeli wyżej i koszt
+1,27 $ go nie obejmują. `deepseek/deepseek-v3.2`, wagi na HF (`deepseek-ai/DeepSeek-V3.2`),
+rozumowanie domyślnie wyłączone — trzeba je włączyć przez `reasoning: {enabled: true}`,
+`supported_efforts` jest puste, więc siły nie da się regulować.
+
+- **84% polskiego w rozumowaniu bez promptu, 100% z promptem** — drugi wynik bez sterowania wśród
+  modeli, które w ogóle myślą po polsku; wyżej tylko Step-3.7-Flash i Mistral Medium 3.5 (po 100%)
+  oraz Ternary-Bonsai-2-27B (92%). Lepiej niż DeepSeek-V4-Flash (79%) i wyraźnie lepiej niż
+  V4-Flash-0731 (69%).
+- **Mediana 319 tokenów rozumowania**, najkrócej w czołówce. Koszt 0,0093 $ za 12 odpowiedzi,
+  czyli trzykrotnie więcej niż V4-Flash (0,0032 $), ale wciąż tanio.
+- **Ślad przyszedł tylko w 9 z 12 odpowiedzi, i wszystkie trzy braki są w wariancie `system_pl`**
+  (pytania `roleplay`, `blat`, `rtv`). Bez promptu 6/6, z promptem 3/6 — polski prompt systemowy
+  TŁUMI u tego modelu rozumowanie. Skoro bez promptu rozumuje po polsku i tak, prompt jest tu
+  zbędnym ryzykiem: przy 400 tys. odpowiedzi każda tura bez śladu to tura do odrzucenia albo
+  ponowienia. V4-Flash ma 12/12 w obu wariantach.
+- Ślad jest prawdziwym rozumowaniem, nie streszczeniem: pierwszoosobowy, z wahaniem („Hmm,
+  użytkownik pyta…"), z rozpisanym działaniem („Początkowa liczba jabłek: 3. Zjadam 1, czyli
+  odejmujemy: 3 - 1…").
+- **Nie zmieści się lokalnie**: ~685B parametrów, czyli ponad kryterium 300B z tych notatek. Jako
+  nauczyciel przez API jest w porządku, ale zejście na własny serwer nie będzie możliwe.
+
+Wniosek: lepszy polski niż V4-Flash, ale mniej niezawodny ślad i trzykrotnie droższy. Jeśli liczy
+się niezawodność i koszt przy 400 tys. odpowiedzi, V4-Flash nadal wygląda lepiej.
 
 ## Następne kroki
 

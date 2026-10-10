@@ -4,14 +4,21 @@ Liczymy samą treść — pytanie, odpowiedź, rozumowanie i ich sumę — bez n
 (BOS, znaczniki ról). Wymaga extra „tokens”: uv sync --extra tokens
 """
 import argparse
+import os
 import json
 import statistics as st
 
-from transformers import AutoTokenizer
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
+from transformers import AutoTokenizer  # noqa: E402
 
 
-def lengths(tok, texts: list[str]) -> list[int]:
-    return [len(x) for x in tok(texts, add_special_tokens=False)["input_ids"]]
+def lengths(tok, texts: list[str], chunk: int = 10000) -> list[int]:
+    # Szybki tokenizer (Rust) koduje paczkę równolegle na wszystkich rdzeniach; paczkami, żeby nie trzymać
+    # w pamięci ID tokenów całego zbioru naraz.
+    out = []
+    for i in range(0, len(texts), chunk):
+        out += [len(x) for x in tok(texts[i:i + chunk], add_special_tokens=False)["input_ids"]]
+    return out
 
 
 def show(name: str, v: list[int]) -> None:

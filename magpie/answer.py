@@ -54,11 +54,15 @@ async def chat(session: aiohttp.ClientSession, args: argparse.Namespace, row: di
     payload = {
         "model": args.model,
         "messages": messages,
-        "max_tokens": args.max_tokens,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "stream": not args.no_stream,
     }
+    if args.max_tokens:
+        payload["max_tokens"] = args.max_tokens
+    for k in ("top_k", "min_p", "presence_penalty", "repetition_penalty"):
+        if getattr(args, k) is not None:
+            payload[k] = getattr(args, k)
     if args.template_kwargs:
         payload["template_vars" if args.backend == "tabby" else "chat_template_kwargs"] = args.template_kwargs
     if args.reasoning_effort:
@@ -245,7 +249,13 @@ def main() -> None:
     p.add_argument("--limit", type=int, default=0, help="tylko pierwsze N pytań (0 = wszystkie)")
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top-p", type=float, default=0.95)
-    p.add_argument("--max-tokens", type=int, default=None, help="domyślnie 5000 (off) / 6000 (on) — prompt + odpowiedź muszą zmieścić się w kontekście serwera")
+    # Niepodane = nie wysyłane; vLLM bierze wtedy wartości z generation_config.json modelu.
+    p.add_argument("--top-k", type=int, default=None)
+    p.add_argument("--min-p", type=float, default=None)
+    p.add_argument("--presence-penalty", type=float, default=None)
+    p.add_argument("--repetition-penalty", type=float, default=None)
+    p.add_argument("--max-tokens", type=int, default=None, help="domyślnie 5000 (off) / 6000 (on) — prompt + odpowiedź muszą zmieścić się w kontekście serwera; "
+                        "0 = nie wysyłaj max_tokens (serwer generuje do końca kontekstu)")
     p.add_argument("--concurrency", type=int, default=500)
     p.add_argument("--rate", type=float, default=100, help="maks. startów zapytań na sekundę")
     p.add_argument("--retries", type=int, default=2)
@@ -291,7 +301,9 @@ def main() -> None:
         args.model = asyncio.run(first_model())
     print(f"pytań: {len(rows)}, gotowych: {len(done)}, do zrobienia: {len(todo)}  (model {args.model}, "
           f"thinking {args.thinking}, {args.backend}: szablon {args.template_kwargs}, reasoning_effort "
-          f"{args.reasoning_effort}, max_tokens {args.max_tokens}, "
+          f"{args.reasoning_effort}, max_tokens {args.max_tokens}, temperature {args.temperature}, top_p {args.top_p}, "
+          f"top_k {args.top_k}, min_p {args.min_p}, presence_penalty {args.presence_penalty}, "
+          f"repetition_penalty {args.repetition_penalty}, "
           f"concurrency {args.concurrency})", flush=True)
     if todo:
         asyncio.run(run(args, todo, out_path))

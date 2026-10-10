@@ -1,0 +1,55 @@
+RUNBOOK — komendy po stronie klienta (z katalogu polskie-dane-instruktazowe)
+Serwery modeli stawiamy osobno; tu tylko skrypty, które je odpytują.
+Każdy run jest wznawialny: ten sam wiersz poleceń pomija gotowe id.
+
+=== 1. Pytania: Magpie na Muse Glimmer (glimmer8) ===
+# nowy --out = nowy losowy master-seed (zapisany w <out>/meta.json)
+.venv/bin/python -m magpie.generate --total 50000 --out data/magpie_glimmer8_X
+# tylko złożenie accepted.jsonl z raw.jsonl
+.venv/bin/python -m magpie.generate --out data/magpie_glimmer8_X --finalize-only
+
+=== 2. Weryfikacja pytań: basal (8 instancji, 192.168.1.26:6001-6008, próg 0.7) ===
+.venv/bin/python -m magpie.verify --input data/magpie_glimmer8_X/accepted.jsonl --out data/verify_glimmer8_X
+# podgląd zapytania / samo podsumowanie odrzuceń
+.venv/bin/python -m magpie.verify --input data/magpie_glimmer8_X/accepted.jsonl --out /tmp/x --dry-run
+.venv/bin/python -m magpie.verify --input data/magpie_glimmer8_X/accepted.jsonl --out data/verify_glimmer8_X --summary-only
+
+=== 3. Łączenie pytań (verdict ok, dedup SHA256, kolejność = priorytet) ===
+.venv/bin/python -m magpie.merge --inputs data/verify_glimmer8_1/verified.jsonl data/verify_glimmer8_2/verified.jsonl \
+  --out data/questions_glimmer8_merged.jsonl
+
+=== 4. Odpowiedzi (domyślny --url http://192.168.1.26:2300/v1) ===
+# Bielik 11B, bez rozumowania
+.venv/bin/python -m magpie.answer --input data/questions_glimmer8_merged.jsonl --out data/answers_bielik11b_nothink
+
+# GLM-4.5-Air (serwer z --reasoning-parser glm45): enable_thinking + polski prompt systemowy (domyślne przy --thinking on)
+.venv/bin/python -m magpie.answer --thinking on \
+  --input data/questions_mistral_redo.jsonl --out data/answers_glm45air_redo3 --concurrency 500
+
+# Mistral Small 4 (tokenizer mistral; chat_template_kwargs daje 400, więc --reasoning-effort)
+#   serwer powinien mieć --reasoning-parser mistral, inaczej [/THINK] bywa wycinany z tekstu
+.venv/bin/python -m magpie.answer --thinking on --reasoning-effort high \
+  --input data/questions_glimmer8_reasoning_merged.jsonl --out data/answers_mistral_small4_think --concurrency 500
+
+# Magistral Small 2509 (oficjalny prompt + dopisek po polsku; '{}' = nie wysyłaj chat_template_kwargs)
+.venv/bin/python -m magpie.answer --thinking on --template-kwargs '{}' \
+  --system "$(cat data/magistral_system.txt)" \
+  --input data/questions_mistral_redo.jsonl --out data/answers_magistral_redo3 --concurrency 500
+
+# TabbyAPI / exl3
+.venv/bin/python -m magpie.answer --backend tabby --url http://192.168.1.26:7654/v1 --api-key 777 \
+  --thinking on --template-kwargs '{"reasoning_effort": "high"}' --input ... --out ...
+
+# przydatne: --limit N (test), --max-tokens, --temperature, --top-p, --system none, --system-in-sft
+# tylko przebudowa sft.jsonl z answers.jsonl
+.venv/bin/python -m magpie.answer --input ... --out data/answers_X --finalize-only
+
+=== 5. Łączenie SFT (dedup po pytaniu, pierwsze wejście wygrywa, tasowanie seed 29382948) ===
+# zbiory z rozumowaniem PRZED Bielikiem, żeby przy duplikacie zostało rozumowanie
+.venv/bin/python -m magpie.merge_sft --inputs data/answers_mistral_small4_think/sft.jsonl \
+  data/answers_glm45air_redo3/sft.jsonl data/glimmer8_day_and_night_merged/sft.jsonl \
+  --out data/glimmer8_bielik_mistral_glm_merged/sft.jsonl
+
+=== 6. Tokeny APT4 (Poziomka), bez narzutu szablonu ===
+# wymaga: uv sync --extra tokens ; < /dev/null ucina pytanie o trust_remote_code
+.venv/bin/python -m magpie.count_tokens --input data/glimmer8_bielik_mistral_glm_merged/sft.jsonl < /dev/null

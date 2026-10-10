@@ -107,6 +107,9 @@ export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
 export PYTHONPATH="${SFT_DIR}:${MEGATRON_PATH}${PYTHONPATH:+:${PYTHONPATH}}"
 
+# --log-throughput (jak w pretreningu Poziomki): TFLOP/s/GPU w logu i w wandb. Wzór Megatrona liczy
+# pełne sekwencje 8192 i uwagę na całym oknie, a przy pakowaniu (87,6% prawdziwych tokenów, uwaga thd
+# tylko w obrębie rozmowy) zawyża wynik; MFU ~ TFLOP/s / 80 (3090 Ti, bf16 z akumulacją fp32, dense).
 # Saves are synchronous and weight-only, as in Poziomka run 10 (async save zeroed weights
 # in runs 5/6). Recompute full as in Poziomka: 1F1B keeps up to 8 microbatches of
 # activations on stage 0.
@@ -128,6 +131,6 @@ exec torchrun --standalone --nproc_per_node=8 "${SFT_DIR}/train_poziomka_sft.py"
     --load "${LOAD_FROM}" --save "${SAVE_CHECKPOINT}" --ckpt-format torch_dist \
     --no-save-optim --no-save-rng \
     --save-interval "${SAVE_INTERVAL}" --eval-interval "${EVAL_INTERVAL}" \
-    --eval-iters "${EVAL_ITERS}" --log-interval 1 --no-one-logger \
+    --eval-iters "${EVAL_ITERS}" --log-interval 1 --log-throughput --no-one-logger \
     --wandb-project "${WANDB_PROJECT}" --wandb-exp-name "${WANDB_NAME}" \
     "${LOAD_ARGS[@]}" "$@"

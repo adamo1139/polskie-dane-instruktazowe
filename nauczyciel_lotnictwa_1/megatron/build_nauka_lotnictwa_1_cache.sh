@@ -5,8 +5,10 @@ set -euo pipefail
 # w formacie v13 dla Bielika 1.5B. Na wzór Ling-V2 build_polskie_sprawy_v3_cache.sh, z różnicami:
 # - dane mają turę system (prompt glimmer8) przed user; loss na wszystkich tokenach (oprócz BOS),
 #   czyli także na prompcie systemowym (domyślne --loss-roles all),
-# - 8192 zamiast 16384 (max_position_embeddings Bielika 1.5B), więc za długie rozmowy tracą
-#   rozumowanie (--long-policy remove-reasoning, wybór smallest-sufficient), a dopiero potem są ucinane,
+# - 8192 zamiast 16384 (max_position_embeddings Bielika 1.5B); za długie rozmowy (141 z 538,079) są
+#   odrzucane (--long-policy drop). remove-reasoning w prepare_poziomka_sft.py wpisuje do treści
+#   stary prefiks v12 '<think>\n</think>\n', który w v13 wygląda jak start rozumowania (po <think>
+#   jest \n) — dokładnie dwuznaczność, którą v13 usuwa; truncate zostawia rozmowy bez <|im_end|>.
 # - tokenizer z katalogu modelu Bielika (ten sam słownik APT4 i ID specjalne co Poziomka).
 # Liczby ON/OFF i kubełków nie są z góry znane: skrypt je wypisuje zamiast porównywać.
 #
@@ -56,7 +58,7 @@ python3 "${SFT_DIR}/prepare_polskie_sprawy_v3.py" \
 
 python3 "${SFT_DIR}/prepare_poziomka_sft.py" \
     --input "${SPLIT_DIR}" --tokenizer "${BIELIK_HF}" --chat-template "${TEMPLATE}" \
-    --output "${CACHE_DIR}" --seq-length "${SEQ_LENGTH}" --long-policy remove-reasoning \
+    --output "${CACHE_DIR}" --seq-length "${SEQ_LENGTH}" --long-policy drop \
     --loss-roles all --workers "${WORKERS}"
 
 PYTHONPATH="${SFT_DIR}" python3 - "${CACHE_DIR}" <<'PY'
@@ -79,7 +81,7 @@ for path in sorted(glob.glob(f"{cache}/train/*.tokens.bin")):
         nxt = int(s[hit[0] + 4]) if len(hit) else None
         after["ON (\\n)" if nxt == newline else "OFF (<)" if nxt == lt else f"other {nxt}"] += 1
 print("Token after the first <think>:", dict(after))
-print("(przed cache: ON 107,709 / OFF 425,024; ON→OFF = rozmowy, którym zdjęto rozumowanie przy 8192)")
+print("(przed cache: ON 107,709 / OFF 425,024; różnica = rozmowy odrzucone jako za długie)")
 
 totals = json.load(open(f"{cache}/manifest.json"))["totals"]
 print("Manifest totals:", json.dumps(totals, indent=1))

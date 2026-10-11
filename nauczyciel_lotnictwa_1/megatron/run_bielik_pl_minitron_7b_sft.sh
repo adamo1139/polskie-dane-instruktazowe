@@ -30,7 +30,7 @@ SAVE_CHECKPOINT="${SAVE_CHECKPOINT:-/media/nvme_2tb/maked/bielik_train/${RUN_NAM
 RESUME="${RESUME:-0}"
 
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-64}"
-LR="${LR:-5e-5}"
+LR="${LR:-3e-5}"
 WARMUP_ITERS="${WARMUP_ITERS:-20}"
 # 7.5B w bf16 = ~15 GB na zapis (same wagi).
 SAVE_INTERVAL="${SAVE_INTERVAL:-200}"

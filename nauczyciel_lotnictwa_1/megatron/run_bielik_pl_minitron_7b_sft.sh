@@ -104,6 +104,9 @@ export NVTE_FUSED_ATTN="${NVTE_FUSED_ATTN:-0}"
 export NVTE_UNFUSED_ATTN="${NVTE_UNFUSED_ATTN:-0}"
 export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
+# OOM przy 8192 na etapie 0: zabrakło 352 MiB przy 1,26 GiB zarezerwowanych, ale wolnych
+# (fragmentacja); expandable_segments je odzyskuje.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTHONPATH="${SFT_DIR}:${MEGATRON_PATH}${PYTHONPATH:+:${PYTHONPATH}}"
 
 # --log-throughput (jak w pretreningu Poziomki): TFLOP/s/GPU w logu i w wandb. Wzór Megatrona liczy

@@ -7,9 +7,9 @@ set -euo pipefail
 # = 5 na etap). TRAIN_ITERS (1 epoka) i EVAL_ITERS liczone z cache, jeśli nie podane.
 #
 # Uruchomienie na riggu (przykład):
-#   LING_DIR=~/projects/pretrain/Ling-V2 \
-#   SFT_DATA=~/projects/pretrain/bielik-sft-cache-<NAME>-v13-16384 SEQ_LENGTH=16384 \
-#   bash run_bielik_pl_minitron_7b_sft.sh
+#   LING_DIR=~/projects/pretrain/Ling-V2 bash run_bielik_pl_minitron_7b_sft.sh
+# Domyślnie 6144 i cache nauka-lotnictwa-2 (build_nauka_lotnictwa_1_cache.sh z NAME=nauka-lotnictwa-2,
+# SEQ_LENGTH=6144); inne dane: SFT_DATA=..., SEQ_LENGTH=... (musi się zgadzać z cache).
 #
 # Pamięć (szacunek, do sprawdzenia pierwszym krótkim runem): ~0,93 mld parametrów na etap; wagi bf16
 # + gradienty fp32 + Adam fp32 (DP=1, więc rozproszony optymalizator nic nie dzieli) ~ 17 GB/kartę,
@@ -22,8 +22,9 @@ WORK_DIR="${WORK_DIR:-$(cd -- "${LING_DIR}/.." && pwd)}"
 MEGATRON_PATH="${MEGATRON_PATH:-${LING_DIR}/Megatron-LM-core_v0.13.0}"
 source "${SCRIPT_DIR}/bielik_pl_minitron_7b_model_args.sh"
 
-: "${SFT_DATA:?Set SFT_DATA to the cache built by build_nauka_lotnictwa_1_cache.sh}"
-: "${SEQ_LENGTH:?Set SEQ_LENGTH to the cache length}"
+# 6144: przy 8192 run padł na OOM po pierwszym kroku.
+SEQ_LENGTH="${SEQ_LENGTH:-6144}"
+SFT_DATA="${SFT_DATA:-${WORK_DIR}/bielik-sft-cache-nauka-lotnictwa-2-v13-${SEQ_LENGTH}}"
 LOAD_CHECKPOINT="${LOAD_CHECKPOINT:-/media/nvme_2tb/maked/bielik_train/Bielik-PL-Minitron-7B-v3.0-Instruct-dcp}"
 RUN_NAME="${RUN_NAME:-bielik_pl_minitron_7b_sft_$(basename "${SFT_DATA}")}"
 SAVE_CHECKPOINT="${SAVE_CHECKPOINT:-/media/nvme_2tb/maked/bielik_train/${RUN_NAME}}"

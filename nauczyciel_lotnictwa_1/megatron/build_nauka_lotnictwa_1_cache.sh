@@ -16,6 +16,9 @@ set -euo pipefail
 #   DATASET=<hf id> albo RAW_JSONL=<lokalny sft.jsonl>, NAME=<nazwa w katalogach>,
 #   SEQ_LENGTH=..., RECORDS=<oczekiwana liczba rekordów, 0 = nie sprawdzaj>, CACHE_PREFIX=...
 #   Rozmowy mogą być wieloturowe: system, potem user/assistant na przemian, na końcu assistant.
+#   UPSAMPLE_MULTITURN=k: rozmowy z ≥ 2 turami użytkownika wchodzą k razy (kopie mają id
+#   "<id>#<n>", więc trafiają do tego samego podziału train/validation co oryginał — podział
+#   bierze pierwsze 8 znaków id — a prepare_polskie_sprawy_v3.py nie odrzuca ich jako duplikatów).
 #
 # Uruchomienie na riggu:
 #   LING_DIR=~/projects/pretrain/Ling-V2 \
@@ -39,6 +42,7 @@ SPLIT_DIR="${WORK_DIR}/${NAME}-sft-v13"
 CACHE_DIR="${WORK_DIR}/${CACHE_PREFIX}-${NAME}-v13-${SEQ_LENGTH}"
 TEMPLATE="${SFT_DIR}/poziomka_v13_chat_template.jinja"
 WORKERS="${WORKERS:-16}"
+UPSAMPLE_MULTITURN="${UPSAMPLE_MULTITURN:-1}"
 
 for d in "${SPLIT_DIR}" "${CACHE_DIR}"; do
     [[ ! -e "${d}" ]] || { echo "Refusing existing output: ${d}" >&2; exit 1; }
@@ -68,8 +72,29 @@ if bad:
 print(f"All records: system + (user, assistant) x n; turns: {dict(sorted(turns.items()))}")
 PY
 
+SOURCE="${RAW_DIR}/sft.jsonl"
+if [[ "${UPSAMPLE_MULTITURN}" != 1 ]]; then
+    SOURCE="${RAW_DIR}/sft_multiturn_x${UPSAMPLE_MULTITURN}.jsonl"
+    [[ -f "${SOURCE}" ]] || python3 - "${RAW_DIR}/sft.jsonl" "${SOURCE}" "${UPSAMPLE_MULTITURN}" <<'PY'
+import json, sys
+src, dst, k = sys.argv[1], sys.argv[2], int(sys.argv[3])
+n = extra = 0
+with open(src, encoding="utf-8") as fin, open(dst + ".tmp", "x", encoding="utf-8") as fout:
+    for line in fin:
+        r = json.loads(line)
+        fout.write(line)
+        n += 1
+        if sum(m["role"] == "user" for m in r["messages"]) >= 2:
+            for copy in range(1, k):
+                fout.write(json.dumps({**r, "id": f"{r['id']}#{copy}"}, ensure_ascii=False) + "\n")
+                extra += 1
+import os; os.rename(dst + ".tmp", dst)
+print(f"Upsampled multi-turn x{k}: {n:,} records + {extra:,} copies = {n + extra:,}")
+PY
+fi
+
 python3 "${SFT_DIR}/prepare_polskie_sprawy_v3.py" \
-    --input "${RAW_DIR}/sft.jsonl" --output "${SPLIT_DIR}" --off-prefix none
+    --input "${SOURCE}" --output "${SPLIT_DIR}" --off-prefix none
 
 python3 "${SFT_DIR}/prepare_poziomka_sft.py" \
     --input "${SPLIT_DIR}" --tokenizer "${BIELIK_HF}" --chat-template "${TEMPLATE}" \

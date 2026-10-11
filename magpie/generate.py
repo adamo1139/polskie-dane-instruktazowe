@@ -33,7 +33,7 @@ import aiohttp
 from aiolimiter import AsyncLimiter
 
 from .filters import SELF_ANSWER, classify, clean
-from .prompt import STOP_STRINGS, STOP_TOKEN_IDS, build_jobs, build_prompt
+from .prompt import TEMPLATES, build_jobs, build_prompt
 
 
 class StreamTimeout(Exception):
@@ -43,13 +43,13 @@ class StreamTimeout(Exception):
 async def generate(session: aiohttp.ClientSession, args: argparse.Namespace, job: dict) -> dict:
     payload = {
         "model": args.model,
-        "prompt": build_prompt(job["system"]),
+        "prompt": job.get("prompt") or build_prompt(job["system"], args.template),
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "seed": job["seed"],
-        "stop": STOP_STRINGS,
-        "stop_token_ids": STOP_TOKEN_IDS,
+        "stop": TEMPLATES[args.template]["stop"],
+        "stop_token_ids": TEMPLATES[args.template]["stop_token_ids"],
         "stream": True,
     }
     t0 = time.monotonic()
@@ -85,15 +85,19 @@ async def generate(session: aiohttp.ClientSession, args: argparse.Namespace, job
                     parts.append(ch.get("text") or "")
                     if ch.get("finish_reason"):
                         finish = ch["finish_reason"]
-                        stop_reason = ch.get("stop_reason")
+                        # vLLM: stop_reason, SGLang: matched_stop
+                        stop_reason = ch.get("stop_reason", ch.get("matched_stop"))
     raw = "".join(parts).strip()
     return {"raw": raw, "first": raw.split("\n")[0].strip() if raw else "",
-            "finish": finish, "matched_stop": stop_reason,
+            "finish": finish, "matched_stop": stop_reason, "template": args.template,
             "ttft_s": round(ttft or 0.0, 2), "latency_s": round(time.monotonic() - t0, 2)}
 
 
 async def work(session: aiohttp.ClientSession, limiter: AsyncLimiter, args: argparse.Namespace,
-               job: dict, stats: Counter) -> dict:
+               job: dict, stats: Counter, classifier=None) -> dict:
+    # classifier(out, job) -> powód odrzucenia albo None; domyślnie reguły pierwszej tury.
+    # Pełny prompt (job["prompt"], magpie.multiturn) nie trafia do raw.jsonl.
+    meta = {k: v for k, v in job.items() if k != "prompt"}
     last_err = None
     for attempt in range(args.retries + 1):
         async with limiter:
@@ -110,11 +114,11 @@ async def work(session: aiohttp.ClientSession, limiter: AsyncLimiter, args: argp
         if attempt < args.retries:
             await asyncio.sleep(5 * (attempt + 1))
     else:
-        return {**job, "finish": "error", "raw": "", "first": "", "ok": False,
+        return {**meta, "finish": "error", "raw": "", "first": "", "ok": False,
                 "reason": f"błąd: {last_err}", "attempts": args.retries + 1}
     out = clean(out)
-    reason = classify(out, job["system"])
-    return {**job, **out, "reason": reason, "ok": reason is None, "attempts": attempt + 1,
+    reason = classifier(out, job) if classifier else classify(out, job["system"])
+    return {**meta, **out, "reason": reason, "ok": reason is None, "attempts": attempt + 1,
             "self_answer_suspect": bool(SELF_ANSWER.search(out["raw"]))}
 
 
@@ -124,7 +128,7 @@ def pct(values: list[float], q: float) -> float:
     return statistics.quantiles(values, n=100)[int(q) - 1] if len(values) > 1 else values[0]
 
 
-async def run(args: argparse.Namespace, jobs: list[dict], raw_path: str) -> None:
+async def run(args: argparse.Namespace, jobs: list[dict], raw_path: str, classifier=None) -> None:
     queue: asyncio.Queue = asyncio.Queue()
     for j in jobs:
         queue.put_nowait(j)
@@ -165,7 +169,7 @@ async def run(args: argparse.Namespace, jobs: list[dict], raw_path: str) -> None
             except asyncio.QueueEmpty:
                 idle[0] += 1
                 return
-            row = await work(session, limiter, args, job, stats)
+            row = await work(session, limiter, args, job, stats, classifier)
             stats["done"] += 1
             stats["ok" if row["ok"] else ("error" if row["finish"] == "error" else "rej")] += 1
             if row.get("ttft_s"):
@@ -255,6 +259,8 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--url", default="http://192.168.1.26:2300/v1")
     p.add_argument("--model", default="/media/nvme_2tb/maked/models/glimmer")
+    p.add_argument("--template", choices=sorted(TEMPLATES), default="glimmer",
+                   help="glimmer: Muse Glimmer (Harmony); v13: Bielik po SFT nauka-lotnictwa-1 (ChatML Poziomki v13)")
     p.add_argument("--total", type=int, default=50000)
     p.add_argument("--master-seed", type=int, default=None,
                    help="domyślnie losowany dla nowego runu i zapisywany w <out>/meta.json")

@@ -12,6 +12,11 @@ set -euo pipefail
 # - tokenizer z katalogu modelu Bielika (ten sam słownik APT4 i ID specjalne co Poziomka).
 # Liczby ON/OFF i kubełków nie są z góry znane: skrypt je wypisuje zamiast porównywać.
 #
+# Inne dane / model / długość (domyślne = pilotaż 1.5B, cpral/nauka-lotnictwa-1, 8192):
+#   DATASET=<hf id> albo RAW_JSONL=<lokalny sft.jsonl>, NAME=<nazwa w katalogach>,
+#   SEQ_LENGTH=..., RECORDS=<oczekiwana liczba rekordów, 0 = nie sprawdzaj>, CACHE_PREFIX=...
+#   Rozmowy mogą być wieloturowe: system, potem user/assistant na przemian, na końcu assistant.
+#
 # Uruchomienie na riggu:
 #   LING_DIR=~/projects/pretrain/Ling-V2 \
 #   BIELIK_HF=/media/nvme_2tb/maked/models/Bielik-1.5B-v3.0-Instruct \
@@ -24,12 +29,14 @@ set -euo pipefail
 SFT_DIR="${LING_DIR}/examples/sft/megatron"
 WORK_DIR="${WORK_DIR:-$(cd -- "${LING_DIR}/.." && pwd)}"
 
-DATASET="cpral/nauka-lotnictwa-1"
-RECORDS=538079
-SEQ_LENGTH=8192
-RAW_DIR="${WORK_DIR}/nauka-lotnictwa-1"
-SPLIT_DIR="${WORK_DIR}/nauka-lotnictwa-1-sft-v13"
-CACHE_DIR="${WORK_DIR}/bielik-sft-cache-nauka-lotnictwa-1-v13-${SEQ_LENGTH}"
+DATASET="${DATASET:-cpral/nauka-lotnictwa-1}"
+NAME="${NAME:-nauka-lotnictwa-1}"
+RECORDS="${RECORDS:-538079}"
+SEQ_LENGTH="${SEQ_LENGTH:-8192}"
+CACHE_PREFIX="${CACHE_PREFIX:-bielik-sft-cache}"
+RAW_DIR="${WORK_DIR}/${NAME}"
+SPLIT_DIR="${WORK_DIR}/${NAME}-sft-v13"
+CACHE_DIR="${WORK_DIR}/${CACHE_PREFIX}-${NAME}-v13-${SEQ_LENGTH}"
 TEMPLATE="${SFT_DIR}/poziomka_v13_chat_template.jinja"
 WORKERS="${WORKERS:-16}"
 
@@ -38,19 +45,27 @@ for d in "${SPLIT_DIR}" "${CACHE_DIR}"; do
 done
 [[ -f "${BIELIK_HF}/tokenizer.json" ]] || { echo "No tokenizer.json in ${BIELIK_HF}" >&2; exit 1; }
 
-if [[ ! -f "${RAW_DIR}/sft.jsonl" ]]; then
+if [[ -n "${RAW_JSONL:-}" ]]; then
+    mkdir -p "${RAW_DIR}"
+    [[ -f "${RAW_DIR}/sft.jsonl" ]] || cp "${RAW_JSONL}" "${RAW_DIR}/sft.jsonl"
+elif [[ ! -f "${RAW_DIR}/sft.jsonl" ]]; then
     hf download "${DATASET}" --repo-type dataset --include sft.jsonl --local-dir "${RAW_DIR}"
 fi
 records=$(wc -l < "${RAW_DIR}/sft.jsonl")
-[[ "${records}" == "${RECORDS}" ]] || { echo "Expected ${RECORDS} records in ${RAW_DIR}/sft.jsonl, found ${records}" >&2; exit 1; }
-# Every record must start with the Magpie system prompt.
+[[ "${RECORDS}" == 0 || "${records}" == "${RECORDS}" ]] || { echo "Expected ${RECORDS} records in ${RAW_DIR}/sft.jsonl, found ${records}" >&2; exit 1; }
+# Every record: Magpie system prompt, then user/assistant alternating, ending with assistant.
 python3 - "${RAW_DIR}/sft.jsonl" <<'PY'
-import json, sys
-bad = sum(1 for line in open(sys.argv[1], encoding="utf-8")
-          if [m["role"] for m in json.loads(line)["messages"]] != ["system", "user", "assistant"])
+import collections, json, sys
+bad, turns = 0, collections.Counter()
+for line in open(sys.argv[1], encoding="utf-8"):
+    roles = [m["role"] for m in json.loads(line)["messages"]]
+    n = (len(roles) - 1) // 2
+    if roles != ["system"] + ["user", "assistant"] * n or n < 1:
+        bad += 1
+    turns[n] += 1
 if bad:
-    sys.exit(f"{bad} records are not system, user, assistant")
-print("All records: system, user, assistant")
+    sys.exit(f"{bad} records are not system + (user, assistant) x n")
+print(f"All records: system + (user, assistant) x n; turns: {dict(sorted(turns.items()))}")
 PY
 
 python3 "${SFT_DIR}/prepare_polskie_sprawy_v3.py" \

@@ -63,7 +63,7 @@ def clean(out: dict) -> dict:
     return out
 
 
-def classify(out: dict, system: str) -> str | None:
+def classify(out: dict, system: str, skip: tuple[str, ...] = ()) -> str | None:
     raw = out["raw"]
     if out["finish"] != "stop":
         return "brak EOS"
@@ -80,7 +80,7 @@ def classify(out: dict, system: str) -> str | None:
     if len(raw.split()) < 3:
         return "za krótkie"
     for test, reason in QUALITY_RULES:
-        if test(raw):
+        if reason not in skip and test(raw):
             return reason
     if EN_LEAK.search(raw):
         return "przeciek EN"

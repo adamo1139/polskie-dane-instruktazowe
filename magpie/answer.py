@@ -49,8 +49,14 @@ def split_reasoning(content: str, reasoning: str) -> tuple[str, str]:
 
 
 async def chat(session: aiohttp.ClientSession, args: argparse.Namespace, row: dict) -> dict:
-    messages = ([{"role": "system", "content": args.system}] if args.system else []) + \
-               [{"role": "user", "content": row["raw"]}]
+    if row.get("history"):
+        # Rozmowa wieloturowa (magpie.multiturn): jej własny prompt systemowy i historia bez
+        # rozumowania; --system nie jest wtedy używany.
+        messages = [{"role": m["role"], "content": m["content"]} for m in row["history"]] + \
+                   [{"role": "user", "content": row["raw"]}]
+    else:
+        messages = ([{"role": "system", "content": args.system}] if args.system else []) + \
+                   [{"role": "user", "content": row["raw"]}]
     payload = {
         "model": args.model,
         "messages": messages,
@@ -116,7 +122,8 @@ async def chat(session: aiohttp.ClientSession, args: argparse.Namespace, row: di
 
 
 async def work(session: aiohttp.ClientSession, args: argparse.Namespace, row: dict, stats: Counter) -> dict:
-    base = {k: row[k] for k in ("id", "raw", "topic", "persona", "subtopics") if k in row}
+    base = {k: row[k] for k in ("id", "raw", "topic", "persona", "subtopics", "history", "meta", "target_turns",
+                                "turn") if k in row}
     base.update(model=args.model, thinking=args.thinking, template_kwargs=args.template_kwargs,
                 reasoning_effort=args.reasoning_effort)
     last_err = None
@@ -206,21 +213,34 @@ def finalize(out_dir: str, system: str | None = None) -> None:
                 continue  # nie nadpisuj udanej odpowiedzi późniejszym błędem
             rows[r["id"]] = r
     good = [r for r in sorted(rows.values(), key=lambda r: r["id"]) if r["ok"]]
+    mismatch = 0
     with open(os.path.join(out_dir, "sft.jsonl"), "w", encoding="utf-8") as f:
         for r in good:
             assistant = {"role": "assistant", "content": r["answer"]}
             if r["reasoning"]:
                 assistant["reasoning_content"] = r["reasoning"]
-            messages = ([{"role": "system", "content": system}] if system else []) + \
-                       [{"role": "user", "content": r["raw"]}, assistant]
-            f.write(json.dumps({"id": r["id"], "messages": messages,
-                                "meta": {k: r.get(k) for k in ("topic", "persona", "model", "thinking",
-                                                               "template_kwargs", "reasoning_effort")
-                                         if r.get(k) is not None}},
+            if r.get("history"):
+                # Wieloturowa: pełna historia (z rozumowaniem wcześniejszych tur) + nowa tura.
+                # meta z pierwszej tury; turn_models = model każdej tury asystenta po kolei.
+                messages = r["history"] + [{"role": "user", "content": r["raw"]}, assistant]
+                meta = dict(r["meta"])
+                meta["turn_models"] = meta.get("turn_models", [meta.get("model")]) + [os.path.basename(r["model"])]
+                if (meta.get("thinking") == "on") != bool(r["reasoning"]):
+                    mismatch += 1
+                    continue
+                extra = {"target_turns": r["target_turns"]} if "target_turns" in r else {}
+            else:
+                messages = ([{"role": "system", "content": system}] if system else []) + \
+                           [{"role": "user", "content": r["raw"]}, assistant]
+                meta = {k: r.get(k) for k in ("topic", "persona", "model", "thinking",
+                                              "template_kwargs", "reasoning_effort") if r.get(k) is not None}
+                extra = {}
+            f.write(json.dumps({"id": r["id"], "messages": messages, "meta": meta, **extra},
                                ensure_ascii=False) + "\n")
     finish = Counter(r["finish"] for r in rows.values())
-    print(f"\nodpowiedzi: {len(rows)}  do sft.jsonl: {len(good)}  finish_reason: {dict(finish)}  "
-          f"z rozumowaniem: {sum(bool(r['reasoning']) for r in good)}")
+    print(f"\nodpowiedzi: {len(rows)}  do sft.jsonl: {len(good) - mismatch}  finish_reason: {dict(finish)}  "
+          f"z rozumowaniem: {sum(bool(r['reasoning']) for r in good)}"
+          + (f"  pominięte (tryb ≠ meta.thinking rozmowy): {mismatch}" if mismatch else ""))
 
 
 def main() -> None:

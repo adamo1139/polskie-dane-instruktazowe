@@ -1,5 +1,6 @@
 """
-Load an HF Llama checkpoint (Bielik v3, bias in every linear layer) into a Megatron
+Load an HF Llama checkpoint (Bielik v3: 1.5B with bias in every linear layer, PL-Minitron-7B
+without biases) into a Megatron
 model and save it as DCP. Based on Ling-V2 tools/load_hf_save_dcp.py (BailingMoeV2).
 
 Run with torchrun using the same parallelism as training:
@@ -147,11 +148,12 @@ def load_hf_into_model(model, hf_state_dict, args):
         c.copy(attn.linear_qkv.weight, interleave_qkv(
             c.get(f'{prefix}.self_attn.q_proj.weight'), c.get(f'{prefix}.self_attn.k_proj.weight'),
             c.get(f'{prefix}.self_attn.v_proj.weight'), num_query_groups))
-        c.copy(attn.linear_qkv.bias, interleave_qkv(
-            c.get(f'{prefix}.self_attn.q_proj.bias'), c.get(f'{prefix}.self_attn.k_proj.bias'),
-            c.get(f'{prefix}.self_attn.v_proj.bias'), num_query_groups))
         c.copy(attn.linear_proj.weight, c.get(f'{prefix}.self_attn.o_proj.weight'))
-        c.copy(attn.linear_proj.bias, c.get(f'{prefix}.self_attn.o_proj.bias'))
+        if args.add_bias_linear:
+            c.copy(attn.linear_qkv.bias, interleave_qkv(
+                c.get(f'{prefix}.self_attn.q_proj.bias'), c.get(f'{prefix}.self_attn.k_proj.bias'),
+                c.get(f'{prefix}.self_attn.v_proj.bias'), num_query_groups))
+            c.copy(attn.linear_proj.bias, c.get(f'{prefix}.self_attn.o_proj.bias'))
 
         # Input layernorm (fused into linear_qkv in TE)
         c.copy(attn.linear_qkv.layer_norm_weight, c.get(f'{prefix}.input_layernorm.weight'))
@@ -163,10 +165,11 @@ def load_hf_into_model(model, hf_state_dict, args):
         # Dense SwiGLU MLP: fc1 = [gate; up] (Megatron applies act to the first half)
         c.copy(mlp.linear_fc1.weight, torch.cat(
             [c.get(f'{prefix}.mlp.gate_proj.weight'), c.get(f'{prefix}.mlp.up_proj.weight')], dim=0))
-        c.copy(mlp.linear_fc1.bias, torch.cat(
-            [c.get(f'{prefix}.mlp.gate_proj.bias'), c.get(f'{prefix}.mlp.up_proj.bias')], dim=0))
         c.copy(mlp.linear_fc2.weight, c.get(f'{prefix}.mlp.down_proj.weight'))
-        c.copy(mlp.linear_fc2.bias, c.get(f'{prefix}.mlp.down_proj.bias'))
+        if args.add_bias_linear:
+            c.copy(mlp.linear_fc1.bias, torch.cat(
+                [c.get(f'{prefix}.mlp.gate_proj.bias'), c.get(f'{prefix}.mlp.up_proj.bias')], dim=0))
+            c.copy(mlp.linear_fc2.bias, c.get(f'{prefix}.mlp.down_proj.bias'))
 
         print(f'  Loaded layer {layer_idx}')
 

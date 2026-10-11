@@ -4,7 +4,7 @@ set -euo pipefail
 # Convert HF Bielik v3 (Llama, bias in every linear layer) to Megatron DCP format.
 # Based on Ling-V2 tools/convert_hf_to_dcp.sh; uses the same model config as training.
 #
-# Usage: MEGATRON_PATH=.../Megatron-LM-core_v0.13.0 \
+# Usage: MEGATRON_PATH=.../Megatron-LM-core_v0.13.0 [MODEL_ARGS_FILE=...] \
 #   bash convert_bielik_hf_to_dcp.sh <hf-path> <dcp-save-path> [iteration]
 
 # Preserve the user's working patched-P2P/NCCL configuration.
@@ -22,7 +22,8 @@ ITERATION="${3:-1}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${MEGATRON_PATH:?Set MEGATRON_PATH to the Ling-patched Megatron-LM-core_v0.13.0}"
-source "${SCRIPT_DIR}/bielik_1p5b_model_args.sh"
+# MODEL_ARGS_FILE: plik z BIELIK_MODEL_ARGS (domyślnie 1.5B; 7B: bielik_pl_minitron_7b_model_args.sh).
+source "${MODEL_ARGS_FILE:-${SCRIPT_DIR}/bielik_1p5b_model_args.sh}"
 [[ -f "${HF_PATH}/config.json" ]] || { echo "Missing HF config" >&2; exit 1; }
 [[ -f "${MEGATRON_PATH}/pretrain_gpt.py" ]] || { echo "Missing patched Megatron" >&2; exit 1; }
 [[ ! -e "${DCP_SAVE_PATH}" ]] || { echo "Refusing existing output: ${DCP_SAVE_PATH}" >&2; exit 1; }

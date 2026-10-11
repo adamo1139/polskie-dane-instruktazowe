@@ -15,17 +15,39 @@ SYSTEM_TEMPLATE = (
 )
 PERSONAS = [("Polak", "Jego"), ("Polka", "Jej")]
 
-# Szablon Harmony-podobny Glimmera; BOS dokleja serwer w /v1/completions, więc go tu nie ma.
-STOP_STRINGS = ["<|eot|>", "<|start|>"]
-STOP_TOKEN_IDS = [200007, 200008]  # <|eom|>, <|eot|> — <|eom|> nie jest EOS w vLLM, trzeba podać
+# Szablony tury systemowej + otwartej tury użytkownika. BOS dokleja serwer w /v1/completions
+# (sprawdzone dla vLLM z Glimmerem i SGLang z Bielikiem), więc go tu nie ma.
+TEMPLATES = {
+    # Harmony-podobny Glimmera; <|eom|> nie jest EOS w vLLM, trzeba go podać.
+    "glimmer": {"prompt": "<|start|>system<|message|>{system}<|eot|><|start|>user<|message|>",
+                "stop": ["<|eot|>", "<|start|>"], "stop_token_ids": [200007, 200008]},
+    # ChatML Poziomki v13 (APT4): Bielik po SFT na nauka-lotnictwa-1; <|im_end|> = 4.
+    "v13": {"prompt": "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n",
+            "stop": ["<|im_end|>", "<|im_start|>"], "stop_token_ids": [4]},
+}
+# Formaty pełnych tur (historia rozmowy dla magpie.multiturn). Tura asystenta Glimmera sprawdzona przez
+# /tokenize na szablonie modelu: <|start|>assistant to=user<|message|>…<|eot|>.
+TURNS = {
+    "glimmer": {"system": "<|start|>system<|message|>{content}<|eot|>",
+                "user": "<|start|>user<|message|>{content}<|eot|>",
+                "assistant": "<|start|>assistant to=user<|message|>{content}<|eot|>",
+                "open_user": "<|start|>user<|message|>"},
+    # Tura asystenta bez rozumowania jak w szablonie v13: <think></think>\n przed treścią.
+    "v13": {"system": "<|im_start|>system\n{content}<|im_end|>\n",
+            "user": "<|im_start|>user\n{content}<|im_end|>\n",
+            "assistant": "<|im_start|>assistant\n<think></think>\n{content}<|im_end|>\n",
+            "open_user": "<|im_start|>user\n"},
+}
+STOP_STRINGS = TEMPLATES["glimmer"]["stop"]
+STOP_TOKEN_IDS = TEMPLATES["glimmer"]["stop_token_ids"]
 
 
 def join_subtopics(items: list[str]) -> str:
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " albo " + items[-1]
 
 
-def build_prompt(system: str) -> str:
-    return f"<|start|>system<|message|>{system}<|eot|><|start|>user<|message|>"
+def build_prompt(system: str, template: str = "glimmer") -> str:
+    return TEMPLATES[template]["prompt"].format(system=system)
 
 
 def build_jobs(total: int, master_seed: int, subs_min: int, subs_max: int) -> list[dict]:
@@ -45,3 +67,10 @@ def build_jobs(total: int, master_seed: int, subs_min: int, subs_max: int) -> li
             "persona": person, "topic": topic, "subtopics": subs,
         })
     return jobs
+
+
+def build_history_prompt(messages: list[dict], template: str = "glimmer") -> str:
+    """Historia (system, user, assistant, …) + otwarta tura użytkownika. Rozumowanie z historii
+    jest pomijane — użytkownik widzi tylko odpowiedź."""
+    fmt = TURNS[template]
+    return "".join(fmt[m["role"]].format(content=m["content"]) for m in messages) + fmt["open_user"]

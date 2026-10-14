@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Top-k logprobów nauczyciela dla całego cache SFT: jeden proces teacher_topk.py na GPU,
-# potem --finalize (sprawdza komplet kawałków i pisze manifest.json). Przerwany przebieg
-# wystarczy puścić jeszcze raz — gotowe kawałki (.done) są pomijane.
+# Top-k logprobów nauczyciela dla całego cache SFT: jeden proces teacher_topk.py na GPU
+# (logi w ${OUT}/logs, w terminalu jedna linia z sumą postępu i ETA), potem --finalize
+# (sprawdza komplet kawałków i pisze manifest.json). Przerwany przebieg wystarczy puścić
+# jeszcze raz — gotowe kawałki (.done) są pomijane.
 #
 #   CACHE=~/projects/pretrain/bielik-sft-cache-destylowanie-1-v13-8192 \
 #   TEACHER_HF=<eksport HF nauczyciela, bf16> \
@@ -23,6 +24,7 @@ ATTN="${ATTN:-flash_attention_2}"
 SCRIPT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/teacher_topk.py"
 
 mkdir -p "${OUT}/logs"
+rm -f "${OUT}"/logs/rank*.progress
 pids=()
 for ((r = 0; r < GPUS; r++)); do
     CUDA_VISIBLE_DEVICES="${r}" python3 "${SCRIPT}" --cache "${CACHE}" --model "${TEACHER_HF}" \
@@ -31,11 +33,44 @@ for ((r = 0; r < GPUS; r++)); do
         > "${OUT}/logs/rank${r}.log" 2>&1 &
     pids+=($!)
 done
+trap 'kill "${pids[@]}" 2>/dev/null; echo; exit 130' INT TERM
 echo "Uruchomiono ${GPUS} procesów; logi: ${OUT}/logs/rank*.log"
+
+# Suma postępu wszystkich ranków z plików rank*.progress, w jednej odświeżanej linii.
+PROGRESS_PY='
+import json, sys
+from pathlib import Path
+logs, world = Path(sys.argv[1]), int(sys.argv[2])
+parts = []
+for r in range(world):
+    try:
+        parts.append(json.loads((logs / f"rank{r}.progress").read_text()))
+    except (OSError, ValueError):
+        pass
+# Rank jest gotowy, gdy już liczy albo miał wszystko z poprzedniego przebiegu.
+ready = [p for p in parts if p["new"] or p["done"] >= p["total"]]
+rate = sum(p["new"] / p["elapsed"] for p in parts if p["new"])
+if len(ready) < world or not rate:
+    print(f"\rładowanie modelu i pierwsze paczki: {len(ready)}/{world} ranków liczy   ", end="", flush=True)
+    sys.exit()
+done, total = sum(p["done"] for p in parts), sum(p["total"] for p in parts)
+eta = (total - done) / rate
+print(f"\r{done:,}/{total:,} pozycji ({100 * done / total:.1f}%), {rate:,.0f} tok/s, "
+      f"ETA {int(eta // 3600)}h{int(eta % 3600 // 60):02d}m   ", end="", flush=True)
+'
+while [[ -n "$(jobs -r)" ]]; do
+    python3 -c "${PROGRESS_PY}" "${OUT}/logs" "${GPUS}" || true
+    sleep 5
+done
+echo
 
 failed=0
 for r in "${!pids[@]}"; do
-    wait "${pids[$r]}" || { echo "rank ${r} zakończył się błędem — ${OUT}/logs/rank${r}.log" >&2; failed=1; }
+    if ! wait "${pids[$r]}"; then
+        echo "rank ${r} zakończył się błędem — ${OUT}/logs/rank${r}.log:" >&2
+        tail -n 15 "${OUT}/logs/rank${r}.log" >&2
+        failed=1
+    fi
 done
 [[ "${failed}" == 0 ]] || exit 1
 

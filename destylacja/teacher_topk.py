@@ -177,7 +177,31 @@ def run(args):
     if args.tokens_per_batch < manifest["seq_length"]:
         raise SystemExit(f"--tokens-per-batch musi być >= seq_length ({manifest['seq_length']})")
     shards = [s for s in shards if s["split"] in args.splits]
+    # Postęp tego ranku dla launchera (run_teacher_topk.sh pokazuje sumę w jednej linii).
+    total = finished = 0
+    for shard in shards:
+        offsets = np.memmap(cache / f"{shard['prefix']}.offsets.bin", dtype="<u8", mode="r").astype(np.int64)
+        bounds = chunk_bounds(offsets, args.world)
+        n = int(offsets[bounds[args.rank + 1]] - offsets[bounds[args.rank]]) \
+            - (bounds[args.rank + 1] - bounds[args.rank])
+        total += n
+        if (out / f"{shard['prefix']}.rank{args.rank}of{args.world}.done").exists():
+            finished += n
+    progress = out / "logs" / f"rank{args.rank}.progress"
+    started, new_positions = time.time(), 0
+
+    def report():
+        if args.benchmark:
+            return
+        progress.parent.mkdir(parents=True, exist_ok=True)
+        tmp = progress.with_suffix(".tmp")
+        tmp.write_text(json.dumps(dict(done=finished + new_positions, total=total, new=new_positions,
+                                       elapsed=time.time() - started)))
+        tmp.replace(progress)
+
+    report()
     teacher = Teacher(args, cache)
+    started = time.time()
     checked = False
     for shard in shards:
         prefix = shard["prefix"]
@@ -203,6 +227,7 @@ def run(args):
             ids, logp, target = teacher(torch.from_numpy(x).to(args.device), yt, torch.from_numpy(p).to(args.device))
             mass = logp.exp().sum(-1)
             stats["positions"] += len(rows)
+            new_positions += len(rows)
             stats["target_logp_sum"] += target.double().sum().item()
             stats["mass_sum"] += mass.double().sum().item()
             stats["mass_min"] = min(stats["mass_min"], mass.min().item())
@@ -213,6 +238,7 @@ def run(args):
                 maps["topk_ids"][rows] = ids
                 maps["topk_logp"][rows] = logp
                 maps["target_logp"][rows] = target
+            report()
             if b % args.log_every == 0:
                 rate = stats["positions"] / (time.time() - start)
                 print(f"{prefix} r{args.rank}: {batch[-1] + 1 - first}/{last - first} rekordów, "
@@ -231,6 +257,7 @@ def run(args):
         stats.update(seconds=seconds, k=args.k, model=str(Path(args.model).resolve()),
                      cache_manifest_sha256=cache_sha, records_range=[first, last])
         done.write_text(json.dumps(stats, indent=1))
+        report()
 
 
 def finalize(args):

@@ -47,31 +47,39 @@ for r in range(world):
         parts.append(json.loads((logs / f"rank{r}.progress").read_text()))
     except (OSError, ValueError):
         pass
-# Rank jest gotowy, gdy już liczy albo miał wszystko z poprzedniego przebiegu.
+# Rank liczy, gdy ma już nowe pozycje albo miał wszystko z poprzedniego przebiegu.
 ready = [p for p in parts if p["new"] or p["done"] >= p["total"]]
 rate = sum(p["new"] / p["elapsed"] for p in parts if p["new"])
-if len(ready) < world or not rate:
+if len(parts) < world or not rate:
     print(f"\rładowanie modelu i pierwsze paczki: {len(ready)}/{world} ranków liczy   ", end="", flush=True)
     sys.exit()
 done, total = sum(p["done"] for p in parts), sum(p["total"] for p in parts)
+# ETA przy obecnym tempie; dopóki nie liczą wszystkie ranki, jest zaniżone.
 eta = (total - done) / rate
-print(f"\r{done:,}/{total:,} pozycji ({100 * done / total:.1f}%), {rate:,.0f} tok/s, "
-      f"ETA {int(eta // 3600)}h{int(eta % 3600 // 60):02d}m   ", end="", flush=True)
+print(f"\r{len(ready)}/{world} ranków, {done:,}/{total:,} pozycji ({100 * done / total:.1f}%), "
+      f"{rate:,.0f} tok/s, ETA {int(eta // 3600)}h{int(eta % 3600 // 60):02d}m   ", end="", flush=True)
 '
-while [[ -n "$(jobs -r)" ]]; do
+# Rank, który padnie, zatrzymuje cały przebieg od razu (gotowe kawałki zostają na dysku).
+declare -A finished=()
+check_ranks() {
+    for r in "${!pids[@]}"; do
+        [[ -z "${finished[$r]:-}" ]] || continue
+        kill -0 "${pids[$r]}" 2>/dev/null && continue
+        if wait "${pids[$r]}"; then
+            finished[$r]=1
+        else
+            echo; echo "rank ${r} zakończył się błędem — ${OUT}/logs/rank${r}.log:" >&2
+            tail -n 15 "${OUT}/logs/rank${r}.log" >&2
+            kill "${pids[@]}" 2>/dev/null; wait; exit 1
+        fi
+    done
+}
+while (( ${#finished[@]} < GPUS )); do
     python3 -c "${PROGRESS_PY}" "${OUT}/logs" "${GPUS}" || true
-    sleep 5
+    check_ranks
+    (( ${#finished[@]} < GPUS )) && sleep 5
 done
+python3 -c "${PROGRESS_PY}" "${OUT}/logs" "${GPUS}" || true
 echo
-
-failed=0
-for r in "${!pids[@]}"; do
-    if ! wait "${pids[$r]}"; then
-        echo "rank ${r} zakończył się błędem — ${OUT}/logs/rank${r}.log:" >&2
-        tail -n 15 "${OUT}/logs/rank${r}.log" >&2
-        failed=1
-    fi
-done
-[[ "${failed}" == 0 ]] || exit 1
 
 python3 "${SCRIPT}" --cache "${CACHE}" --out "${OUT}" --k "${K}" --world "${GPUS}" --finalize

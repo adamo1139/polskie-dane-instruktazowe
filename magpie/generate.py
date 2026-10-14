@@ -44,14 +44,21 @@ async def generate(session: aiohttp.ClientSession, args: argparse.Namespace, job
     payload = {
         "model": args.model,
         "prompt": job.get("prompt") or build_prompt(job["system"], args.template),
-        "max_tokens": args.max_tokens,
         "temperature": args.temperature,
         "top_p": args.top_p,
         "seed": job["seed"],
         "stop": TEMPLATES[args.template]["stop"],
         "stop_token_ids": TEMPLATES[args.template]["stop_token_ids"],
-        "stream": True,
+        "stream": not getattr(args, "no_stream", False),
     }
+    # /completions bez max_tokens = 16 tokenów (domyślna wartość OpenAI, SGLang ją stosuje) — zawsze wysyłamy.
+    if not args.max_tokens:
+        raise ValueError("max_tokens musi być > 0 dla /v1/completions")
+    payload["max_tokens"] = args.max_tokens
+    # Opcjonalne kary samplowania (magpie.pipeline); generate ich nie ustawia, więc nie są wysyłane.
+    for k in ("top_k", "min_p", "presence_penalty", "frequency_penalty", "repetition_penalty"):
+        if getattr(args, k, None) is not None:
+            payload[k] = getattr(args, k)
     t0 = time.monotonic()
     ttft = None
     parts: list[str] = []
@@ -60,6 +67,14 @@ async def generate(session: aiohttp.ClientSession, args: argparse.Namespace, job
         async with session.post(f"{args.url}/completions", json=payload) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"HTTP {resp.status}: {(await resp.text())[:200]}")
+            if not payload["stream"]:
+                # Bez streamingu: jedna odpowiedź JSON; ttft nieznany, pilnuje tylko --total-timeout.
+                ch = (await resp.json())["choices"][0]
+                raw = (ch.get("text") or "").strip()
+                return {"raw": raw, "first": raw.split("\n")[0].strip() if raw else "",
+                        "finish": ch.get("finish_reason"),
+                        "matched_stop": ch.get("stop_reason", ch.get("matched_stop")), "template": args.template,
+                        "ttft_s": None, "latency_s": round(time.monotonic() - t0, 2)}
             buf = b""
             while True:
                 limit = args.ttft_timeout if ttft is None else args.chunk_timeout
@@ -128,7 +143,8 @@ def pct(values: list[float], q: float) -> float:
     return statistics.quantiles(values, n=100)[int(q) - 1] if len(values) > 1 else values[0]
 
 
-async def run(args: argparse.Namespace, jobs: list[dict], raw_path: str, classifier=None) -> None:
+async def run(args: argparse.Namespace, jobs: list[dict], raw_path: str, classifier=None, work_fn=None) -> None:
+    # work_fn(session, limiter, args, job, stats) -> wiersz z polami ok/finish (magpie.pipeline); domyślnie work.
     queue: asyncio.Queue = asyncio.Queue()
     for j in jobs:
         queue.put_nowait(j)
@@ -169,7 +185,8 @@ async def run(args: argparse.Namespace, jobs: list[dict], raw_path: str, classif
             except asyncio.QueueEmpty:
                 idle[0] += 1
                 return
-            row = await work(session, limiter, args, job, stats, classifier)
+            row = await (work_fn(session, limiter, args, job, stats) if work_fn
+                         else work(session, limiter, args, job, stats, classifier))
             stats["done"] += 1
             stats["ok" if row["ok"] else ("error" if row["finish"] == "error" else "rej")] += 1
             if row.get("ttft_s"):

@@ -36,7 +36,8 @@ def main() -> None:
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
     with open(args.input, encoding="utf-8") as f:
         convs = [json.loads(line)["messages"] for line in f]
-    role = lambda c, r, key="content": next((m.get(key) or "" for m in c if m["role"] == r), "")
+    # Wszystkie wiadomości danej roli (rozmowy wieloturowe), sklejone; tokenizer liczy je razem.
+    role = lambda c, r, key="content": "\n".join(m.get(key) for m in c if m["role"] == r and m.get(key))
 
     print(f"rozmów: {len(convs)}   tokenizer: {args.tokenizer} (słownik {len(tok)})\n")
     prompt = lengths(tok, [role(c, "user") for c in convs])

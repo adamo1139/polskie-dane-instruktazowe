@@ -29,7 +29,11 @@ CONTINUATION = re.compile(r"^\W*(Dziękuj|Dzięki|Bardzo dziękuj|Jasne[,.!]|Ocz
 TRUNCATED = re.compile(r"(\.\.\.|…)\s*\??\s*$")
 META_PROMPT = re.compile(r"naturalne pytanie|krótkie,? naturalne|napisz (jedno |krótkie )?pytanie|"
                          r"zapytam o jeden|jeden z tych tematów|instrukcj|jailbreak|zignoruj poprzednie|"
-                         r"system prompt|prompt systemow|jako model językowy", re.IGNORECASE)
+                         r"system prompt|prompt systemow|jako model językowy|"
+                         # Polecenie dla asystenta, żeby to on zadał pytanie (przeciek promptu Magpie).
+                         r"jedno krótkie pytanie|zadaj (jedno |krótkie )*pytanie|"
+                         r"wybierz (losowo )?jeden z (tych |powyższych )?temat|(z|na) (jeden z )?powyższych tematów|"
+                         r"jeden z powyższych|propozycj\w* tematów|tematów do wyboru", re.IGNORECASE)
 MARKDOWN_DOC = re.compile(r"(^|\n)\s*#{1,4}\s|```")
 SPEAKER_LABEL = re.compile(r"^[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]{2,15}:\s")
 ASSISTANT_RULES = re.compile(r"^\W*(Twoja odpowiedź|Twoje odpowiedzi|Na twojej odpowiedzi|Odpowiadasz|"

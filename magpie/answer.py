@@ -32,6 +32,8 @@ SYSTEM_PL_REASONING = ("Jesteś pomocnym asystentem. Zanim odpowiesz, przemyśl 
                        "Całe rozumowanie prowadź wyłącznie po polsku, a odpowiedź również napisz po polsku.")
 SPEED_WINDOW = 300  # s — prędkość i ETA z ostatnich 5 minut, nie średnia od startu
 LEFTOVER_THINK = re.compile(r"\[/?THINK\]|</?think>")
+# Wywołanie narzędzia zamiast odpowiedzi (model nie ma narzędzi; nawyk z danych treningowych).
+TOOL_CALL = re.compile(r"<function=|<parameter=|</?tool_call>")
 THINK = re.compile(r"^\s*(?:<think>(.*?)</think>|\[THINK\](.*?)\[/THINK\])\s*", re.DOTALL)
 
 
@@ -66,7 +68,7 @@ async def chat(session: aiohttp.ClientSession, args: argparse.Namespace, row: di
     }
     if args.max_tokens:
         payload["max_tokens"] = args.max_tokens
-    for k in ("top_k", "min_p", "presence_penalty", "repetition_penalty"):
+    for k in ("top_k", "min_p", "presence_penalty", "frequency_penalty", "repetition_penalty"):
         if getattr(args, k) is not None:
             payload[k] = getattr(args, k)
     if args.template_kwargs:
@@ -132,9 +134,15 @@ async def work(session: aiohttp.ClientSession, args: argparse.Namespace, row: di
             out = await chat(session, args, row)
             # Niezamknięty blok rozumowania (np. [THINK] bez [/THINK]) — nie da się oddzielić myślenia od odpowiedzi.
             unclosed = bool(LEFTOVER_THINK.search(out["answer"]))
-            ok = out["finish"] == "stop" and bool(out["answer"]) and not unclosed
+            # --thinking on, a rozumowania brak: model od razu zamknął blok myślenia.
+            no_reasoning = args.thinking == "on" and not out["reasoning"]
+            tool_call = bool(TOOL_CALL.search(out["answer"]))
+            ok = out["finish"] == "stop" and bool(out["answer"]) and not (unclosed or no_reasoning or tool_call)
+            out["no_reasoning"], out["tool_call"] = no_reasoning, tool_call
             out["unclosed_reasoning"] = unclosed
-            stats["ok" if ok else ("niezamknięte rozumowanie" if unclosed else "ucięte/puste")] += 1
+            stats["ok" if ok else "niezamknięte rozumowanie" if unclosed else "ucięte/puste"
+                  if out["finish"] != "stop" or not out["answer"] else "brak rozumowania" if no_reasoning
+                  else "wywołanie narzędzia"] += 1
             return {**base, **out, "ok": ok, "attempts": attempt + 1}
         except (StreamTimeout, TimeoutError) as e:
             stats["timeout"] += 1
@@ -173,7 +181,8 @@ async def run(args: argparse.Namespace, rows: list[dict], out_path: str) -> None
             recent.popleft()
         speed = len(recent) / max(min(SPEED_WINDOW, now - t0), 1e-9)
         print(f"{n}/{len(rows)}  ok {stats['ok']}  ucięte/puste {stats['ucięte/puste']}  "
-              f"niezamknięte rozum. {stats['niezamknięte rozumowanie']}  "
+              f"niezamknięte rozum. {stats['niezamknięte rozumowanie']}  brak rozum. {stats['brak rozumowania']}  "
+              f"narzędzie {stats['wywołanie narzędzia']}  "
               f"błędy {stats['error']}  timeouty {stats['timeout']}  http {stats['http_err']}  "
               f"{speed:.2f} odp/s (ost. 5 min)  ETA {(len(rows) - n) / max(speed, 1e-9) / 60:.0f} min", flush=True)
 
@@ -273,6 +282,7 @@ def main() -> None:
     p.add_argument("--top-k", type=int, default=None)
     p.add_argument("--min-p", type=float, default=None)
     p.add_argument("--presence-penalty", type=float, default=None)
+    p.add_argument("--frequency-penalty", type=float, default=None)
     p.add_argument("--repetition-penalty", type=float, default=None)
     p.add_argument("--max-tokens", type=int, default=None, help="domyślnie 5000 (off) / 6000 (on) — prompt + odpowiedź muszą zmieścić się w kontekście serwera; "
                         "0 = nie wysyłaj max_tokens (serwer generuje do końca kontekstu)")
@@ -323,6 +333,7 @@ def main() -> None:
           f"thinking {args.thinking}, {args.backend}: szablon {args.template_kwargs}, reasoning_effort "
           f"{args.reasoning_effort}, max_tokens {args.max_tokens}, temperature {args.temperature}, top_p {args.top_p}, "
           f"top_k {args.top_k}, min_p {args.min_p}, presence_penalty {args.presence_penalty}, "
+          f"frequency_penalty {args.frequency_penalty}, "
           f"repetition_penalty {args.repetition_penalty}, "
           f"concurrency {args.concurrency})", flush=True)
     if todo:

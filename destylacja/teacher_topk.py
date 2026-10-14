@@ -155,16 +155,23 @@ def check_packing(teacher, tokens, offsets, batch):
     if len(batch) < 2:
         return False
     x, y, p, _ = gather_batch(tokens, offsets, batch)
-    packed = teacher(*(torch.from_numpy(a).to(teacher.device) for a in (x, y, p)))
-    single = [teacher(*(torch.from_numpy(a).to(teacher.device) for a in gather_batch(tokens, offsets, [i])[:3]))
-              for i in batch]
+    dev = lambda a: torch.from_numpy(a).to(teacher.device)
+    packed = teacher(dev(x), dev(y), dev(p))
+    # Wzorzec przecieku: ta sama paczka z ciągłymi position_ids, czyli zwykła causal attention
+    # przez wszystkie rekordy.
+    leaked = teacher(dev(x), dev(y), dev(np.arange(len(x))))
+    single = [teacher(*(dev(a) for a in gather_batch(tokens, offsets, [i])[:3])) for i in batch]
     single = [torch.cat(parts) for parts in zip(*single)]
-    top1 = (packed[0][:, 0] == single[0][:, 0]).float().mean().item()
-    diff = (packed[2] - single[2]).abs().mean().item()
+    # Pierwszy rekord paczki jest zawsze identyczny; przeciek widać dopiero w kolejnych.
+    rest = slice(int(offsets[batch[0] + 1] - offsets[batch[0]]) - 1, None)
+    top1 = (packed[0][rest, 0] == single[0][rest, 0]).float().mean().item()
+    diff = (packed[2][rest] - single[2][rest]).abs().mean().item()
+    leak = (leaked[2][rest] - single[2][rest]).abs().mean().item()
     print(f"check pakowania: {len(batch)} rekordów, {len(x)} pozycji, zgodność top-1 {top1:.4f}, "
-          f"śr. |Δ target logp| {diff:.4f}", flush=True)
-    # bf16 i inna kolejność redukcji dają drobne różnice; przeciek daje różnice rzędu jednostek.
-    if top1 < 0.98 or diff > 0.05:
+          f"śr. |Δ target logp| {diff:.4f} (przy przecieku {leak:.4f})", flush=True)
+    # Szum bf16 (inne kształty, inna kolejność redukcji) zależy od rekordów, więc nie stały próg,
+    # tylko porównanie ze wzorcem przecieku.
+    if diff > 0.25 * leak:
         raise SystemExit("Paczka różni się od osobnych forwardów — packing nie działa (attn_implementation?)")
     return True
 

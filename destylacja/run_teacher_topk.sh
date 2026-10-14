@@ -5,7 +5,7 @@ set -euo pipefail
 # potem --finalize (sprawdza komplet kawałków i pisze manifest.json). Przerwany przebieg
 # wystarczy puścić jeszcze raz — gotowe kawałki (.done) są pomijane.
 #
-#   CACHE=~/projects/pretrain/bielik-sft-cache-destylowanie-1-v13-6144 \
+#   CACHE=~/projects/pretrain/bielik-sft-cache-destylowanie-1-v13-8192 \
 #   TEACHER_HF=<eksport HF nauczyciela, bf16> \
 #   OUT=~/projects/pretrain/teacher-topk-destylowanie-1-k40 \
 #   bash run_teacher_topk.sh

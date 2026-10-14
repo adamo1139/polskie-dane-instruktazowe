@@ -1,0 +1,48 @@
+{# Poziomka v13 — wersja do inferencji (np. router SGLang / smg z minijinja).
+   Renderuje dokładnie ten sam tekst co szablon treningowy, ale bez {% generation %}
+   (rozszerzenie transformers do masek lossu, którego minijinja nie zna) i bez metod
+   Pythona (.get, .startswith), które w minijinja wymagają trybu pycompat.
+   ON:  <think>\n{rozumowanie}\n</think>\n{odpowiedz}
+   OFF: <think></think>\n{odpowiedz} #}
+{{- bos_token -}}
+{%- if tools is defined and tools is string -%}
+    {{- raise_exception('Przed renderowaniem zdekoduj tools z JSON.') -}}
+{%- endif -%}
+{%- if enable_thinking is defined and enable_thinking is not sameas true and enable_thinking is not sameas false -%}
+    {{- raise_exception('enable_thinking musi być wartością bool.') -}}
+{%- endif -%}
+{%- for message in messages -%}
+    {{- '<|im_start|>' + message['role'] + '\n' -}}
+    {%- if message['role'] == 'tool' -%}
+        {{- {'tool_call_id': message['tool_call_id'], 'name': message['name'], 'content': message['content']} | tojson -}}
+    {%- else -%}
+        {%- set content = message['content'] if message['content'] is defined and message['content'] else '' -%}
+        {%- if message['role'] == 'assistant' -%}
+            {%- if message['reasoning_content'] is defined and message['reasoning_content'] -%}
+                {{- '<think>\n' + message['reasoning_content'] + '\n</think>\n' -}}
+            {%- elif content[:7] != '<think>' -%}
+                {{- '<think></think>\n' -}}
+            {%- endif -%}
+        {%- endif -%}
+        {{- content -}}
+        {%- if loop.first and tools is defined and tools -%}
+            {{- '\n\nDostępne narzędzia (JSON):\n' -}}{{- tools | tojson -}}
+        {%- endif -%}
+        {%- if message['tool_calls'] is defined and message['tool_calls'] -%}
+            {%- for call in message['tool_calls'] -%}
+                {{- '\n<tool_call>' -}}
+                {{- {'id': call['id'], 'name': call['function']['name'], 'arguments': call['function']['arguments']} | tojson -}}
+                {{- '</tool_call>' -}}
+            {%- endfor -%}
+        {%- endif -%}
+    {%- endif -%}
+    {{- '<|im_end|>' + '\n' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|im_start|>assistant\n' -}}
+    {%- if enable_thinking is sameas true -%}
+        {{- '<think>\n' -}}
+    {%- elif enable_thinking is sameas false -%}
+        {{- '<think></think>\n' -}}
+    {%- endif -%}
+{%- endif -%}

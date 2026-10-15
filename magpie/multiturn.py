@@ -16,6 +16,19 @@ mieszczą się naraz na GPU:
   python -m magpie.multiturn ask --input data/mt/answers_t2/sft.jsonl --out data/mt/ask_t3
   … (do tury 5; rozmowy 2-turowe kończą się po answers_t2)
 
+  pipeline — jeden model (Bielik po SFT, szablon v13) pisze i pytania, i odpowiedzi: wszystkie
+            brakujące tury rozmowy w jednym przebiegu, zapytanie po zapytaniu (/v1/completions):
+            historia + otwarta tura user → pytanie; to samo + pytanie + otwarta tura asystenta →
+            odpowiedź; to samo + odpowiedź + otwarta tura user → kolejne pytanie… Każde zapytanie
+            przedłuża poprzednie, więc prefix caching (RadixAttention) trzyma całą rozmowę.
+            Odrzucone pytanie/odpowiedź dostaje od razu kolejne próby (--attempts, nowy seed);
+            rozmowa, która utknie, zostaje z turami zrobionymi do tej pory. Wynik: raw.jsonl i po
+            zakończeniu sft.jsonl (rozmowy z ≥ 2 turami użytkownika; bez systemu, chyba że
+            --system-in-sft).
+
+  python -m magpie.multiturn pipeline --input data/mt_v6/round1.jsonl --out data/mt_v6/pipeline \\
+      --model <model na serwerze> --context 8192 --answer-temperature 0.9 --answer-frequency-penalty 0.03
+
 Filtry tury użytkownika: reguły pierwszej tury (filters.classify) poza „kontynuacją rozmowy”
 („Dzięki, a…”, „A jeśli…” są tu naturalne) + powtórzenie wcześniejszego pytania + echo odpowiedzi.
 Wznowienie = ten sam wiersz poleceń; gotowe id (rozmowy) są pomijane. --retry-rejected N: rozmowa,
@@ -24,6 +37,7 @@ po zakończonym runie); do accepted.jsonl trafia pierwsza przyjęta próba, raw.
 """
 import argparse
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -32,9 +46,10 @@ import re
 from collections import Counter
 from difflib import SequenceMatcher
 
-from .filters import classify
+from .filters import classify, clean
 from .generate import run
-from .prompt import TEMPLATES, build_history_prompt
+from .pipeline import ASSISTANT_OPEN, answer_args, call, split_answer
+from .prompt import TEMPLATES, TURNS, build_history_prompt
 
 
 def normalize(text: str) -> str:
@@ -158,6 +173,129 @@ def cmd_ask(args: argparse.Namespace) -> None:
     finalize(args.out)
 
 
+def call_seed(conv_id: str, turn: int, stage: str, attempt: int) -> int:
+    return int(hashlib.sha256(f"{conv_id}:{turn}:{stage}:{attempt}".encode()).hexdigest()[:8], 16)
+
+
+async def pipeline_work(session, limiter, args, job, stats) -> dict:
+    """Wszystkie brakujące tury jednej rozmowy; zwraca wiersz raw.jsonl z pełnymi messages."""
+    msgs = [dict(m) for m in job["messages"]]
+    meta = dict(job["meta"])
+    meta["turn_models"] = meta.get("turn_models", [meta.get("model")])
+    model = os.path.basename(args.model.rstrip("/"))
+    history = [{"role": m["role"], "content": m["content"]} for m in msgs]  # bez reasoning_content
+    prompt = build_history_prompt(history, "v13")
+    turn = sum(m["role"] == "user" for m in msgs) + 1
+    row = {"id": job["id"], "target_turns": job["target_turns"]}
+    tries: list[int] = []
+    while turn <= job["target_turns"]:
+        if args.context - len(prompt) // 2 < args.min_answer_tokens + args.max_tokens:
+            return {**row, "messages": msgs, "meta": meta, "turns": turn - 1, "tries": tries,
+                    "ok": False, "finish": "stop", "stage": "pytanie", "reason": "za długa historia"}
+        question = reason = None
+        for attempt in range(args.attempts):
+            q = await call(session, limiter, args,
+                           {"seed": call_seed(job["id"], turn, "q", attempt), "prompt": prompt}, stats)
+            if q["finish"] == "error":
+                return {**row, "turns": turn - 1, "ok": False, "finish": "error", "stage": "pytanie",
+                        "reason": f"błąd: {q.get('error')}"}
+            q = clean(q)
+            reason = classify_followup(q, {"system": msgs[0]["content"], "history": history}, args.repeat_ratio)
+            if not reason:
+                question = q["raw"]
+                tries.append(attempt + 1)
+                break
+            stats[f"odrzucone pytanie: {reason}"] += 1
+        if question is None:
+            return {**row, "messages": msgs, "meta": meta, "turns": turn - 1, "tries": tries,
+                    "ok": False, "finish": "stop", "stage": "pytanie", "reason": reason}
+
+        a_prompt = prompt + question + ASSISTANT_OPEN["off"]
+        a_args = copy.copy(args.answer)
+        budget = args.context - len(a_prompt) // 2 - 32
+        a_args.max_tokens = min(args.answer_max_tokens, budget) if args.answer_max_tokens else budget
+        answer = why = None
+        for attempt in range(args.answer_attempts):
+            a = await call(session, limiter, a_args,
+                           {"seed": call_seed(job["id"], turn, "a", attempt), "prompt": a_prompt}, stats)
+            if a["finish"] == "error":
+                return {**row, "turns": turn - 1, "ok": False, "finish": "error", "stage": "odpowiedź",
+                        "reason": f"błąd: {a.get('error')}"}
+            _, text, why = split_answer(a["raw"], "off") if a["finish"] == "stop" else ("", "", "ucięte")
+            if not why:
+                answer = text
+                break
+            stats[f"odrzucona odpowiedź: {why}"] += 1
+        if answer is None:
+            return {**row, "messages": msgs, "meta": meta, "turns": turn - 1, "tries": tries,
+                    "ok": False, "finish": "stop", "stage": "odpowiedź", "reason": why}
+
+        msgs += [{"role": "user", "content": question}, {"role": "assistant", "content": answer}]
+        history += [{"role": "user", "content": question}, {"role": "assistant", "content": answer}]
+        meta["turn_models"] = meta["turn_models"] + [model]
+        # Dokładnie to, co dopisałby build_history_prompt: koniec tury asystenta + otwarta tura user.
+        prompt = a_prompt + answer + "<|im_end|>\n" + TURNS["v13"]["open_user"]
+        turn += 1
+    return {**row, "messages": msgs, "meta": meta, "turns": turn - 1, "tries": tries,
+            "ok": True, "finish": "stop", "stage": "koniec", "reason": None}
+
+
+def pipeline_finalize(out_dir: str, system_in_sft: bool) -> None:
+    rows = {}
+    with open(os.path.join(out_dir, "raw.jsonl"), encoding="utf-8") as f:
+        for line in f:
+            r = json.loads(line)
+            if r["id"] in rows and r.get("finish") == "error":
+                continue
+            rows[r["id"]] = r
+    good = [r for r in sorted(rows.values(), key=lambda r: r["id"])
+            if r.get("finish") != "error" and r.get("turns", 0) >= 2]
+    with open(os.path.join(out_dir, "sft.jsonl"), "w", encoding="utf-8") as f:
+        for r in good:
+            msgs = r["messages"] if system_in_sft else [m for m in r["messages"] if m["role"] != "system"]
+            f.write(json.dumps({"id": r["id"], "messages": msgs, "meta": r["meta"]}, ensure_ascii=False) + "\n")
+    stopped = Counter(f"{r.get('stage')}: {r.get('reason')}" for r in rows.values() if not r["ok"])
+    print(f"\nrozmów: {len(rows)}  do sft.jsonl: {len(good)}  tury użytkownika: "
+          f"{dict(sorted(Counter(r['turns'] for r in good).items()))}  "
+          f"próby na przyjęte pytanie: {dict(sorted(Counter(t for r in good for t in r.get('tries', [])).items()))}")
+    print("zatrzymane:", dict(stopped.most_common(12)))
+
+
+def cmd_pipeline(args: argparse.Namespace) -> None:
+    os.makedirs(args.out, exist_ok=True)
+    raw_path = os.path.join(args.out, "raw.jsonl")
+    if args.finalize_only:
+        pipeline_finalize(args.out, args.system_in_sft)
+        return
+    if not args.context:
+        raise SystemExit("Podaj --context (= --context-length serwera; router SGLang go nie podaje)")
+    args.url = args.url.rstrip("/")
+    args.template = "v13"
+    args.answer = answer_args(args)
+    done: set[str] = set()
+    if os.path.exists(raw_path):
+        with open(raw_path, encoding="utf-8") as f:
+            done = {r["id"] for r in map(json.loads, f) if r.get("finish") != "error"}
+    jobs = []
+    with open(args.input, encoding="utf-8") as f:
+        for line in f:
+            r = json.loads(line)
+            msgs = r["messages"]
+            target = args.target_turns or r["target_turns"]
+            if r["id"] in done or msgs[0]["role"] != "system" or msgs[-1]["role"] != "assistant":
+                continue
+            if sum(m["role"] == "user" for m in msgs) >= target:
+                continue
+            jobs.append({"id": r["id"], "messages": msgs, "meta": r["meta"], "target_turns": target})
+    print(f"rozmów do zrobienia: {len(jobs)}, gotowych: {len(done)}  (model {args.model}, kontekst {args.context}, "
+          f"próby pytania/odpowiedzi {args.attempts}/{args.answer_attempts}, concurrency {args.concurrency}, "
+          f"rate {args.rate}/s; pytanie T={args.temperature} top_p={args.top_p}; odpowiedź "
+          f"T={args.answer_temperature} top_p={args.answer_top_p} freq={args.answer_frequency_penalty})", flush=True)
+    if jobs:
+        asyncio.run(run(args, jobs, raw_path, work_fn=pipeline_work))
+    pipeline_finalize(args.out, args.system_in_sft)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -201,8 +339,49 @@ def main() -> None:
                    help="nadpisz docelową liczbę tur z wierszy wejścia (0 = z wierszy)")
     a.add_argument("--finalize-only", action="store_true")
 
+    m = sub.add_parser("pipeline", help="pytania i odpowiedzi jednym modelem (v13), cała rozmowa naraz")
+    m.add_argument("--input", required=True, help="wynik select (system, user, assistant + target_turns)")
+    m.add_argument("--out", required=True, help="katalog wynikowy (raw.jsonl, sft.jsonl)")
+    m.add_argument("--url", default="http://192.168.1.26:2300/v1")
+    m.add_argument("--model", required=True, help="nazwa modelu na serwerze (Bielik po SFT, szablon v13)")
+    m.add_argument("--context", type=int, default=0, help="kontekst serwera w tokenach (wymagany)")
+    m.add_argument("--target-turns", type=int, default=0, help="nadpisz target_turns z wejścia (0 = z wierszy)")
+    m.add_argument("--attempts", type=int, default=3, help="prób na jedno pytanie (nowy seed po odrzucie)")
+    m.add_argument("--answer-attempts", type=int, default=2, help="prób na jedną odpowiedź")
+    m.add_argument("--repeat-ratio", type=float, default=0.75)
+    m.add_argument("--min-answer-tokens", type=int, default=512,
+                   help="nie zaczynaj tury, gdy po pytaniu zostałoby mniej kontekstu na odpowiedź")
+    m.add_argument("--system-in-sft", action="store_true", help="zostaw prompt glimmer8 w sft.jsonl")
+    # pytanie
+    m.add_argument("--temperature", type=float, default=1.0)
+    m.add_argument("--top-p", type=float, default=0.95)
+    m.add_argument("--max-tokens", type=int, default=1024)
+    m.add_argument("--ttft-timeout", type=float, default=600)
+    m.add_argument("--chunk-timeout", type=float, default=300)
+    m.add_argument("--total-timeout", type=float, default=900)
+    # odpowiedź (jak magpie.pipeline)
+    m.add_argument("--answer-temperature", type=float, default=0.7)
+    m.add_argument("--answer-top-p", type=float, default=0.95)
+    m.add_argument("--answer-top-k", type=int, default=None)
+    m.add_argument("--answer-min-p", type=float, default=None)
+    m.add_argument("--answer-presence-penalty", type=float, default=None)
+    m.add_argument("--answer-frequency-penalty", type=float, default=None)
+    m.add_argument("--answer-repetition-penalty", type=float, default=None)
+    m.add_argument("--answer-max-tokens", type=int, default=0, help="0 = reszta kontekstu po prompcie")
+    m.add_argument("--answer-ttft-timeout", type=float, default=3600)
+    m.add_argument("--answer-chunk-timeout", type=float, default=600)
+    m.add_argument("--answer-total-timeout", type=float, default=7200)
+    # wspólne
+    m.add_argument("--no-stream", action="store_true")
+    m.add_argument("--concurrency", type=int, default=1500)
+    m.add_argument("--rate", type=float, default=200, help="zapytań/s (każda tura to 2+ zapytania)")
+    m.add_argument("--retries", type=int, default=2, help="ponowienia po błędzie HTTP/timeoucie")
+    m.add_argument("--flush-every", type=int, default=100)
+    m.add_argument("--progress-every", type=int, default=500)
+    m.add_argument("--finalize-only", action="store_true")
+
     args = p.parse_args()
-    cmd_select(args) if args.cmd == "select" else cmd_ask(args)
+    {"select": cmd_select, "ask": cmd_ask, "pipeline": cmd_pipeline}[args.cmd](args)
 
 
 if __name__ == "__main__":

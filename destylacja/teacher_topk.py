@@ -219,8 +219,18 @@ class SGLangTeacher:
                 raise SystemExit(f"SGLang zwrócił {len(toks)}/{len(tops)} pozycji dla rekordu o {len(ids_in)} "
                                  "tokenach (logprob_start_len=0 powinien dać wszystkie)")
             # Pozycja 0 (BOS) nie ma predykcji; pozycja j to rozkład dla tokenu j.
-            if [t[1] for t in toks[1:]] != ids_in[1:]:
-                raise SystemExit("Tokeny w logprobach SGLang nie zgadzają się z rekordem cache")
+            got = [t[1] for t in toks[1:]]
+            if got != ids_in[1:]:
+                diff = next(j for j, (a, b) in enumerate(zip(got, ids_in[1:])) if a != b) + 1
+                raise SystemExit(
+                    "Tokeny w logprobach SGLang nie zgadzają się z rekordem cache.\n"
+                    f"  rekord {i}: {len(ids_in)} tokenów, pierwsza różnica na pozycji {diff}\n"
+                    f"  ids rekordu[:8]:          {ids_in[:8]}\n"
+                    f"  input_token_logprobs[:8]: {toks[:8]}\n"
+                    f"  input_top_logprobs[:2]:   {tops[:2]}\n"
+                    f"  wokół różnicy: rekord {ids_in[max(diff - 3, 0):diff + 3]}, "
+                    f"SGLang {[t[1] for t in toks[max(diff - 3, 0):diff + 3]]}\n"
+                    f"  inne klucze meta_info: {sorted(meta)}")
             s, e = int(offsets[i]), int(offsets[i + 1])
             rows.append(np.arange(s + 1, e))
             labels.append(np.asarray(ids_in[1:], dtype=np.int64))

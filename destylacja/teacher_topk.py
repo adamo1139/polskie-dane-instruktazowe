@@ -200,7 +200,10 @@ class SGLangTeacher:
         self.engine = sgl.Engine(
             model_path=args.model, skip_tokenizer_init=True, disable_radix_cache=True,
             context_length=args.context_length, mem_fraction_static=args.mem_fraction,
-            chunked_prefill_size=args.chunked_prefill, log_level="error")
+            chunked_prefill_size=args.chunked_prefill,
+            # Generujemy 1 token: grafy CUDA dla dekodowania nic nie dają, a zjadają pamięć,
+            # której logity wszystkich pozycji promptu (chunk × słownik × fp32) potrzebują.
+            disable_cuda_graph=True, log_level="error")
 
     def score(self, tokens, offsets, batch):
         """→ (rows, topk_ids <u2 [n,k], topk_logp f32 [n,k], target_logp f32 [n], targets int64 [n])."""
@@ -389,8 +392,10 @@ def main():
     p.add_argument("--backend", choices=["hf", "sglang"], default="hf",
                    help="sglang: silnik SGLang offline (np. W8A8 INT8 z kernelami int8); hf: transformers")
     p.add_argument("--context-length", type=int, default=0, help="sglang: kontekst silnika (0 = seq_length+1 cache)")
-    p.add_argument("--mem-fraction", type=float, default=0.8, help="sglang: mem_fraction_static")
-    p.add_argument("--chunked-prefill", type=int, default=8192, help="sglang: chunked_prefill_size")
+    p.add_argument("--mem-fraction", type=float, default=0.5,
+                   help="sglang: mem_fraction_static (reszta karty na logity promptu)")
+    p.add_argument("--chunked-prefill", type=int, default=4096,
+                   help="sglang: chunked_prefill_size; logity jednego kawałka = chunk × 32000 × 4 B")
     p.add_argument("--benchmark", type=int, default=0, help="N rekordów z pierwszego shardu, bez zapisu")
     p.add_argument("--log-every", type=int, default=50, help="co ile paczek wypisać postęp")
     p.add_argument("--finalize", action="store_true", help="sprawdź komplet .done i zapisz manifest.json")

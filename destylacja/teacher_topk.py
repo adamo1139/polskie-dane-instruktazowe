@@ -115,8 +115,17 @@ class Teacher:
             b = PreTrainedTokenizerFast.from_pretrained(str(cache / "tokenizer")).get_vocab()
             if a != b:
                 raise SystemExit("Tokenizer modelu różni się od tokenizera cache")
+        extra = {}
+        quant = getattr(config, "quantization_config", None) or {}
+        if (quant.get("quant_method") if isinstance(quant, dict) else getattr(quant, "quant_method", None)) \
+                == "compressed-tensors":
+            # W8A8 (llm-compressor): skompresowane wagi int8 nie przechodzą przez zwykły forward
+            # (F.linear bf16 × int8), więc rozpakowujemy je raz do bf16 przy ładowaniu. Wartości wag
+            # zostają skwantyzowane; kwantyzacji aktywacji (jak w SGLang/vLLM) tu nie ma.
+            from transformers import CompressedTensorsConfig
+            extra["quantization_config"] = CompressedTensorsConfig(run_compressed=False)
         self.model = AutoModelForCausalLM.from_pretrained(
-            args.model, torch_dtype=torch.bfloat16, attn_implementation=args.attn,
+            args.model, torch_dtype=torch.bfloat16, attn_implementation=args.attn, **extra,
         ).to(args.device).eval()
         self.k, self.chunk, self.device = args.k, args.logit_chunk, args.device
 

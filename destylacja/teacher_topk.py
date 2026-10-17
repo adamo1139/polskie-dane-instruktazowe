@@ -226,8 +226,9 @@ class SGLangTeacher:
             # z prawdziwym ID), więc ostatni token słownika (APT4: 31999 = '°') porównujemy jako 0.
             last_id = self.vocab_size - 1
             got = [t[1] for t in toks[1:]]
-            if got != [0 if t == last_id else t for t in ids_in[1:]]:
-                diff = next(j for j, (a, b) in enumerate(zip(got, ids_in[1:])) if a != b) + 1
+            expected = [0 if t == last_id else t for t in ids_in[1:]]
+            if got != expected:
+                diff = next(j for j, (a, b) in enumerate(zip(got, expected)) if a != b) + 1
                 raise SystemExit(
                     "Tokeny w logprobach SGLang nie zgadzają się z rekordem cache.\n"
                     f"  rekord {i}: {len(ids_in)} tokenów, pierwsza różnica na pozycji {diff}\n"

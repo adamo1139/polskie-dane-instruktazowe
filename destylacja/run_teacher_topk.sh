@@ -19,8 +19,12 @@ set -euo pipefail
 : "${OUT:?Set OUT to the output directory}"
 K="${K:-40}"
 GPUS="${GPUS:-8}"
-TOKENS_PER_BATCH="${TOKENS_PER_BATCH:-16384}"
+# BACKEND=sglang: silnik SGLang offline (W8A8 INT8 z kernelami int8), ATTN wtedy nie ma znaczenia.
+BACKEND="${BACKEND:-hf}"
 ATTN="${ATTN:-flash_attention_2}"
+EXTRA=(--backend "${BACKEND}" --attn "${ATTN}")
+# Puste = domyślne dla backendu (hf 16384, sglang 262144).
+[[ -n "${TOKENS_PER_BATCH:-}" ]] && EXTRA+=(--tokens-per-batch "${TOKENS_PER_BATCH}")
 SCRIPT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/teacher_topk.py"
 
 mkdir -p "${OUT}/logs"
@@ -29,7 +33,7 @@ pids=()
 for ((r = 0; r < GPUS; r++)); do
     CUDA_VISIBLE_DEVICES="${r}" python3 "${SCRIPT}" --cache "${CACHE}" --model "${TEACHER_HF}" \
         --out "${OUT}" --k "${K}" --rank "${r}" --world "${GPUS}" \
-        --tokens-per-batch "${TOKENS_PER_BATCH}" --attn "${ATTN}" \
+        "${EXTRA[@]}" \
         > "${OUT}/logs/rank${r}.log" 2>&1 &
     pids+=($!)
 done

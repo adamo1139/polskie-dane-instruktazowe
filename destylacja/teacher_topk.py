@@ -185,11 +185,70 @@ def check_packing(teacher, tokens, offsets, batch):
     return True
 
 
-def run(args):
+class SGLangTeacher:
+    """Ten sam wynik co Teacher, ale przez silnik SGLang offline (prawdziwe kernele W8A8 INT8).
+
+    Każdy rekord idzie w całości jako input_ids; SGLang zwraca dla każdej pozycji promptu top-k
+    i logprob tokenu, który tam stoi (pozycja 0 nie ma predykcji). Paczkowanie robi sam silnik.
+    Radix cache wyłączony: rekordy się nie powtarzają, a dla pozycji wziętych z cache prefiksu
+    SGLang nie liczyłby logprobów od nowa.
+    """
+
+    def __init__(self, args, cache):
+        import sglang as sgl
+        self.k = args.k
+        self.engine = sgl.Engine(
+            model_path=args.model, skip_tokenizer_init=True, disable_radix_cache=True,
+            context_length=args.context_length, mem_fraction_static=args.mem_fraction,
+            chunked_prefill_size=args.chunked_prefill, log_level="error")
+
+    def score(self, tokens, offsets, batch):
+        """→ (rows, topk_ids <u2 [n,k], topk_logp f32 [n,k], target_logp f32 [n], targets int64 [n])."""
+        prompts = [tokens[int(offsets[i]):int(offsets[i + 1])].astype(np.int64).tolist() for i in batch]
+        outs = self.engine.generate(
+            input_ids=prompts, return_logprob=True, logprob_start_len=0, top_logprobs_num=self.k,
+            sampling_params=[{"max_new_tokens": 1, "temperature": 1.0, "top_p": 1.0, "top_k": -1}] * len(prompts))
+        rows, ids, logp, target, labels = [], [], [], [], []
+        for i, ids_in, o in zip(batch, prompts, outs):
+            meta = o["meta_info"]
+            tops, toks = meta["input_top_logprobs"], meta["input_token_logprobs"]
+            if len(toks) != len(ids_in) or len(tops) != len(ids_in):
+                raise SystemExit(f"SGLang zwrócił {len(toks)}/{len(tops)} pozycji dla rekordu o {len(ids_in)} "
+                                 "tokenach (logprob_start_len=0 powinien dać wszystkie)")
+            # Pozycja 0 (BOS) nie ma predykcji; pozycja j to rozkład dla tokenu j.
+            if [t[1] for t in toks[1:]] != ids_in[1:]:
+                raise SystemExit("Tokeny w logprobach SGLang nie zgadzają się z rekordem cache")
+            s, e = int(offsets[i]), int(offsets[i + 1])
+            rows.append(np.arange(s + 1, e))
+            labels.append(np.asarray(ids_in[1:], dtype=np.int64))
+            target.append(np.fromiter((t[0] for t in toks[1:]), np.float32, e - s - 1))
+            flat = [x for pos in tops[1:] for x in pos[:self.k]]
+            if len(flat) != (e - s - 1) * self.k:
+                raise SystemExit(f"SGLang zwrócił mniej niż top-{self.k} na pozycję (--max-logprobs?)")
+            logp.append(np.fromiter((x[0] for x in flat), np.float32, len(flat)).reshape(-1, self.k))
+            ids.append(np.fromiter((x[1] for x in flat), np.uint16, len(flat)).reshape(-1, self.k))
+        return (np.concatenate(rows), np.concatenate(ids), np.concatenate(logp),
+                np.concatenate(target), np.concatenate(labels))
+
+
+def hf_score(teacher, tokens, offsets, batch, device):
     import torch
+    x, y, p, rows = gather_batch(tokens, offsets, batch)
+    ids, logp, target = teacher(torch.from_numpy(x).to(device), torch.from_numpy(y).to(device),
+                                torch.from_numpy(p).to(device))
+    return (rows, ids.to(torch.int16).cpu().numpy().view("<u2"), logp.float().cpu().numpy(),
+            target.float().cpu().numpy(), y)
+
+
+def run(args):
     cache, out = Path(args.cache).resolve(), Path(args.out).resolve()
     manifest, shards = load_cache(cache)
     cache_sha = sha256(cache / "manifest.json")
+    if args.tokens_per_batch is None:
+        # HF: jeden forward na paczkę; SGLang: jedno generate() na paczkę, silnik dzieli ją sam.
+        args.tokens_per_batch = 262144 if args.backend == "sglang" else 16384
+    if not args.context_length:
+        args.context_length = manifest["seq_length"] + 1  # rekord ma do seq_length + 1 tokenów
     if args.tokens_per_batch < manifest["seq_length"]:
         raise SystemExit(f"--tokens-per-batch musi być >= seq_length ({manifest['seq_length']})")
     shards = [s for s in shards if s["split"] in args.splits]
@@ -216,9 +275,10 @@ def run(args):
         tmp.replace(progress)
 
     report()
-    teacher = Teacher(args, cache)
+    sglang = args.backend == "sglang"
+    teacher = SGLangTeacher(args, cache) if sglang else Teacher(args, cache)
     started = time.time()
-    checked = False
+    checked = sglang  # test pakowania dotyczy tylko HF (SGLang paczkuje sam)
     for shard in shards:
         prefix = shard["prefix"]
         tokens = np.memmap(cache / f"{prefix}.tokens.bin", dtype="<u2", mode="r")
@@ -238,22 +298,19 @@ def run(args):
         for b, batch in enumerate(batches(offsets, first, last, args.tokens_per_batch)):
             if not checked:
                 checked = check_packing(teacher, tokens, offsets, batch)
-            x, y, p, rows = gather_batch(tokens, offsets, batch)
-            yt = torch.from_numpy(y).to(args.device)
-            ids, logp, target = teacher(torch.from_numpy(x).to(args.device), yt, torch.from_numpy(p).to(args.device))
-            mass = logp.exp().sum(-1)
+            rows, ids, logp, target, y = (teacher.score(tokens, offsets, batch) if sglang
+                                          else hf_score(teacher, tokens, offsets, batch, args.device))
+            mass = np.exp(logp.astype(np.float64)).sum(-1)
             stats["positions"] += len(rows)
             new_positions += len(rows)
-            stats["target_logp_sum"] += target.double().sum().item()
-            stats["mass_sum"] += mass.double().sum().item()
-            stats["mass_min"] = min(stats["mass_min"], mass.min().item())
-            stats["top1_hits"] += (ids[:, 0] == yt).sum().item()
-            ids, logp, target = ids.to(torch.int16).cpu().numpy().view("<u2"), logp.half().cpu().numpy(), \
-                target.half().cpu().numpy()
+            stats["target_logp_sum"] += float(target.astype(np.float64).sum())
+            stats["mass_sum"] += float(mass.sum())
+            stats["mass_min"] = min(stats["mass_min"], float(mass.min()))
+            stats["top1_hits"] += int((ids[:, 0].astype(np.int64) == y).sum())
             if maps is not None:
                 maps["topk_ids"][rows] = ids
-                maps["topk_logp"][rows] = logp
-                maps["target_logp"][rows] = target
+                maps["topk_logp"][rows] = logp.astype(np.float16)
+                maps["target_logp"][rows] = target.astype(np.float16)
             report()
             if b % args.log_every == 0:
                 rate = stats["positions"] / (time.time() - start)
@@ -270,7 +327,7 @@ def run(args):
             return
         for m in maps.values():
             m.flush()
-        stats.update(seconds=seconds, k=args.k, model=str(Path(args.model).resolve()),
+        stats.update(seconds=seconds, k=args.k, model=str(Path(args.model).resolve()), backend=args.backend,
                      cache_manifest_sha256=cache_sha, records_range=[first, last])
         done.write_text(json.dumps(stats, indent=1))
         report()
@@ -324,10 +381,16 @@ def main():
     p.add_argument("--splits", nargs="+", default=["train", "validation"])
     p.add_argument("--rank", type=int, default=0)
     p.add_argument("--world", type=int, default=1)
-    p.add_argument("--tokens-per-batch", type=int, default=16384, help="pozycji wejścia w jednym forwardzie")
+    p.add_argument("--tokens-per-batch", type=int, default=None,
+                   help="pozycji wejścia na paczkę (domyślnie hf 16384, sglang 262144)")
     p.add_argument("--logit-chunk", type=int, default=4096, help="pozycji na raz przez lm_head + log_softmax")
     p.add_argument("--attn", default="flash_attention_2", help="musi obsługiwać packing przez position_ids")
     p.add_argument("--device", default="cuda", help="cpu tylko do testów")
+    p.add_argument("--backend", choices=["hf", "sglang"], default="hf",
+                   help="sglang: silnik SGLang offline (np. W8A8 INT8 z kernelami int8); hf: transformers")
+    p.add_argument("--context-length", type=int, default=0, help="sglang: kontekst silnika (0 = seq_length+1 cache)")
+    p.add_argument("--mem-fraction", type=float, default=0.8, help="sglang: mem_fraction_static")
+    p.add_argument("--chunked-prefill", type=int, default=8192, help="sglang: chunked_prefill_size")
     p.add_argument("--benchmark", type=int, default=0, help="N rekordów z pierwszego shardu, bez zapisu")
     p.add_argument("--log-every", type=int, default=50, help="co ile paczek wypisać postęp")
     p.add_argument("--finalize", action="store_true", help="sprawdź komplet .done i zapisz manifest.json")

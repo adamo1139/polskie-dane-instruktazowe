@@ -196,7 +196,9 @@ class SGLangTeacher:
 
     def __init__(self, args, cache):
         import sglang as sgl
+        from transformers import AutoConfig
         self.k = args.k
+        self.vocab_size = AutoConfig.from_pretrained(args.model).vocab_size
         self.engine = sgl.Engine(
             model_path=args.model, skip_tokenizer_init=True, disable_radix_cache=True,
             context_length=args.context_length, mem_fraction_static=args.mem_fraction,
@@ -219,8 +221,12 @@ class SGLangTeacher:
                 raise SystemExit(f"SGLang zwrócił {len(toks)}/{len(tops)} pozycji dla rekordu o {len(ids_in)} "
                                  "tokenach (logprob_start_len=0 powinien dać wszystkie)")
             # Pozycja 0 (BOS) nie ma predykcji; pozycja j to rozkład dla tokenu j.
+            # SGLang (logprob_result_processor.py) raportuje ID >= vocab_size - 1 jako 0 — błąd o jeden
+            # w czyszczeniu hashy obrazów; dotyczy tylko raportu (wejście modelu i logprob liczone są
+            # z prawdziwym ID), więc ostatni token słownika (APT4: 31999 = '°') porównujemy jako 0.
+            last_id = self.vocab_size - 1
             got = [t[1] for t in toks[1:]]
-            if got != ids_in[1:]:
+            if got != [0 if t == last_id else t for t in ids_in[1:]]:
                 diff = next(j for j, (a, b) in enumerate(zip(got, ids_in[1:])) if a != b) + 1
                 raise SystemExit(
                     "Tokeny w logprobach SGLang nie zgadzają się z rekordem cache.\n"

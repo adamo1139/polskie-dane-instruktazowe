@@ -101,20 +101,28 @@ def batches(offsets, first, last, tokens_per_batch):
         yield batch
 
 
+def check_model_vocab(model, cache):
+    """Nauczyciel musi mieć słownik APT4 identyczny z cache (oba backendy; ID tokenów są nasze)."""
+    from transformers import AutoConfig, PreTrainedTokenizerFast
+    config = AutoConfig.from_pretrained(model)
+    if config.vocab_size != 32000:
+        raise SystemExit(f"vocab_size {config.vocab_size} != 32000: to nie jest model z APT4")
+    # Ten sam słownik co cache (raz już pobrał się Minitron z innym tokenizerem).
+    if not (Path(model) / "tokenizer.json").exists():
+        raise SystemExit(f"Brak tokenizer.json w {model} — nie da się sprawdzić słownika")
+    a = PreTrainedTokenizerFast.from_pretrained(model).get_vocab()
+    b = PreTrainedTokenizerFast.from_pretrained(str(cache / "tokenizer")).get_vocab()
+    if a != b:
+        raise SystemExit("Tokenizer modelu różni się od tokenizera cache")
+    return config
+
+
 class Teacher:
     def __init__(self, args, cache):
         import torch
-        from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedTokenizerFast
+        from transformers import AutoModelForCausalLM
         self.torch = torch
-        config = AutoConfig.from_pretrained(args.model)
-        if config.vocab_size != 32000:
-            raise SystemExit(f"vocab_size {config.vocab_size} != 32000: to nie jest model z APT4")
-        # Ten sam słownik co cache (raz już pobrał się Minitron z innym tokenizerem).
-        if (Path(args.model) / "tokenizer.json").exists():
-            a = PreTrainedTokenizerFast.from_pretrained(args.model).get_vocab()
-            b = PreTrainedTokenizerFast.from_pretrained(str(cache / "tokenizer")).get_vocab()
-            if a != b:
-                raise SystemExit("Tokenizer modelu różni się od tokenizera cache")
+        config = check_model_vocab(args.model, cache)
         extra = {}
         quant = getattr(config, "quantization_config", None) or {}
         if (quant.get("quant_method") if isinstance(quant, dict) else getattr(quant, "quant_method", None)) \
@@ -196,9 +204,8 @@ class SGLangTeacher:
 
     def __init__(self, args, cache):
         import sglang as sgl
-        from transformers import AutoConfig
         self.k = args.k
-        self.vocab_size = AutoConfig.from_pretrained(args.model).vocab_size
+        self.vocab_size = check_model_vocab(args.model, cache).vocab_size
         self.engine = sgl.Engine(
             model_path=args.model, skip_tokenizer_init=True, disable_radix_cache=True,
             context_length=args.context_length, mem_fraction_static=args.mem_fraction,

@@ -37,6 +37,20 @@ import numpy as np
 
 FORMAT = "teacher-topk-v1"
 CACHE_FORMAT = "poziomka-sft-v2"
+# "<think></think>\n" w turze asystenta v13 (APT4); te same 10 tokenów maskuje --kd-mask-think
+# w treningu (poziomka-destylacja/poziomka_kd_data.py), więc statystyki kd_* pomijają je też tu.
+THINK_OFF_BLOCK = np.array([31981, 1531, 11141, 31977, 31981, 31965, 1531, 11141, 31977, 17], dtype=np.int64)
+
+
+def think_block_positions(y):
+    """Maska bool pozycji w y (tokeny docelowe), które należą do THINK_OFF_BLOCK."""
+    n = len(THINK_OFF_BLOCK)
+    out = np.zeros(len(y), dtype=bool)
+    if len(y) >= n:
+        hits = np.flatnonzero((np.lib.stride_tricks.sliding_window_view(y, n) == THINK_OFF_BLOCK).all(1))
+        for h in hits:
+            out[h:h + n] = True
+    return out
 
 
 def sha256(path):
@@ -309,6 +323,7 @@ def run(args):
     for shard in shards:
         prefix = shard["prefix"]
         tokens = np.memmap(cache / f"{prefix}.tokens.bin", dtype="<u2", mode="r")
+        masks = np.memmap(cache / f"{prefix}.masks.bin", dtype=np.uint8, mode="r")
         offsets = np.memmap(cache / f"{prefix}.offsets.bin", dtype="<u8", mode="r").astype(np.int64)
         bounds = chunk_bounds(offsets, args.world)
         first, last = bounds[args.rank], bounds[args.rank + 1]
@@ -319,8 +334,10 @@ def run(args):
             print(f"{prefix}: kawałek {args.rank}/{args.world} już gotowy", flush=True)
             continue
         maps = None if args.benchmark else open_outputs(out, shard, args.k)
+        # kd_*: tylko pozycje, które wejdą do lossu KD (maska cache, bez bloku think).
         stats = dict(records=last - first, positions=0, target_logp_sum=0.0, mass_sum=0.0,
-                     top1_hits=0, mass_min=1.0)
+                     top1_hits=0, mass_min=1.0, kd_positions=0, kd_target_logp_sum=0.0,
+                     kd_mass_sum=0.0, kd_top1_hits=0)
         start = time.time()
         for b, batch in enumerate(batches(offsets, first, last, args.tokens_per_batch)):
             if not checked:
@@ -333,7 +350,13 @@ def run(args):
             stats["target_logp_sum"] += float(target.astype(np.float64).sum())
             stats["mass_sum"] += float(mass.sum())
             stats["mass_min"] = min(stats["mass_min"], float(mass.min()))
-            stats["top1_hits"] += int((ids[:, 0].astype(np.int64) == y).sum())
+            hit = ids[:, 0].astype(np.int64) == y
+            stats["top1_hits"] += int(hit.sum())
+            kd = (masks[rows] > 0) & ~think_block_positions(y)
+            stats["kd_positions"] += int(kd.sum())
+            stats["kd_target_logp_sum"] += float(target[kd].astype(np.float64).sum())
+            stats["kd_mass_sum"] += float(mass[kd].sum())
+            stats["kd_top1_hits"] += int(hit[kd].sum())
             if maps is not None:
                 maps["topk_ids"][rows] = ids
                 maps["topk_logp"][rows] = logp.astype(np.float16)
@@ -349,6 +372,10 @@ def run(args):
                    f"({stats['positions'] / seconds:,.0f} tok/s); NLL nauczyciela "
                    f"{-stats['target_logp_sum'] / n:.4f}, top-1 {stats['top1_hits'] / n:.4f}, "
                    f"masa top-{args.k} śr. {stats['mass_sum'] / n:.4f} min {stats['mass_min']:.4f}")
+        m = max(stats["kd_positions"], 1)
+        summary += (f"\n  tylko pozycje KD (maska cache bez bloku think, {stats['kd_positions']:,} = "
+                    f"{100 * stats['kd_positions'] / n:.1f}%): NLL {-stats['kd_target_logp_sum'] / m:.4f}, "
+                    f"top-1 {stats['kd_top1_hits'] / m:.4f}, masa top-{args.k} {stats['kd_mass_sum'] / m:.4f}")
         print(summary, flush=True)
         if args.benchmark:
             return
@@ -383,14 +410,22 @@ def finalize(args):
         files = {name: path.relative_to(out).as_posix() for name, path in out_paths(out, shard["prefix"]).items()}
         result.append(dict(prefix=shard["prefix"], split=shard["split"], records=shard["records"],
                            tokens=shard["tokens"], files=files))
-        t = totals.setdefault(shard["split"], dict(positions=0, target_logp_sum=0.0, mass_sum=0.0, top1_hits=0))
+        t = totals.setdefault(shard["split"], dict(positions=0, target_logp_sum=0.0, mass_sum=0.0, top1_hits=0,
+                                                   kd_positions=0, kd_target_logp_sum=0.0, kd_mass_sum=0.0,
+                                                   kd_top1_hits=0))
         for key in t:
-            t[key] += sum(p[key] for p in parts)
+            t[key] += sum(p.get(key, 0) for p in parts)  # kd_* brak w starszych .done
     for split, t in totals.items():
         n = t["positions"]
         t.update(teacher_nll=-t["target_logp_sum"] / n, top1=t["top1_hits"] / n, mass_mean=t["mass_sum"] / n)
         print(f"{split}: {n:,} pozycji, NLL {t['teacher_nll']:.4f}, top-1 {t['top1']:.4f}, "
               f"masa top-{args.k} {t['mass_mean']:.4f}")
+        if t["kd_positions"]:
+            m = t["kd_positions"]
+            t.update(kd_teacher_nll=-t["kd_target_logp_sum"] / m, kd_top1=t["kd_top1_hits"] / m,
+                     kd_mass_mean=t["kd_mass_sum"] / m)
+            print(f"  tylko pozycje KD: {m:,}, NLL {t['kd_teacher_nll']:.4f}, top-1 {t['kd_top1']:.4f}, "
+                  f"masa top-{args.k} {t['kd_mass_mean']:.4f}")
     (out / "manifest.json").write_text(json.dumps(dict(
         format=FORMAT, k=args.k, model=parts[0]["model"], temperature=1.0,
         cache=str(cache), cache_manifest_sha256=cache_sha, seq_length=manifest["seq_length"],

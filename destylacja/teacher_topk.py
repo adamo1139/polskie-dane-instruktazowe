@@ -42,6 +42,17 @@ CACHE_FORMAT = "poziomka-sft-v2"
 THINK_OFF_BLOCK = np.array([31981, 1531, 11141, 31977, 31981, 31965, 1531, 11141, 31977, 17], dtype=np.int64)
 
 
+def bucket_entropy(logp):
+    """Entropia rozkładu top-k + jeden kubełek ogona (jak w lossie KD) dla każdej pozycji [n].
+
+    Kubełek łączy cały ogon w jedno zdarzenie, więc to dolne ograniczenie prawdziwej entropii.
+    """
+    p = np.exp(logp.astype(np.float64))
+    tail = np.clip(1.0 - p.sum(-1), 0.0, 1.0)
+    h = -(p * logp.astype(np.float64)).sum(-1)
+    return h - np.where(tail > 0, tail * np.log(np.where(tail > 0, tail, 1.0)), 0.0)
+
+
 def think_block_positions(y):
     """Maska bool pozycji w y (tokeny docelowe), które należą do THINK_OFF_BLOCK."""
     n = len(THINK_OFF_BLOCK)
@@ -337,7 +348,7 @@ def run(args):
         # kd_*: tylko pozycje, które wejdą do lossu KD (maska cache, bez bloku think).
         stats = dict(records=last - first, positions=0, target_logp_sum=0.0, mass_sum=0.0,
                      top1_hits=0, mass_min=1.0, kd_positions=0, kd_target_logp_sum=0.0,
-                     kd_mass_sum=0.0, kd_top1_hits=0)
+                     kd_mass_sum=0.0, kd_top1_hits=0, kd_conf_sum=0.0, kd_entropy_sum=0.0)
         start = time.time()
         for b, batch in enumerate(batches(offsets, first, last, args.tokens_per_batch)):
             if not checked:
@@ -357,6 +368,9 @@ def run(args):
             stats["kd_target_logp_sum"] += float(target[kd].astype(np.float64).sum())
             stats["kd_mass_sum"] += float(mass[kd].sum())
             stats["kd_top1_hits"] += int(hit[kd].sum())
+            # Pewność (p top-1) wobec trafności top-1 = kalibracja; entropia = jak miękki jest rozkład.
+            stats["kd_conf_sum"] += float(np.exp(logp[kd, 0].astype(np.float64)).sum())
+            stats["kd_entropy_sum"] += float(bucket_entropy(logp[kd]).sum())
             if maps is not None:
                 maps["topk_ids"][rows] = ids
                 maps["topk_logp"][rows] = logp.astype(np.float16)
@@ -375,7 +389,9 @@ def run(args):
         m = max(stats["kd_positions"], 1)
         summary += (f"\n  tylko pozycje KD (maska cache bez bloku think, {stats['kd_positions']:,} = "
                     f"{100 * stats['kd_positions'] / n:.1f}%): NLL {-stats['kd_target_logp_sum'] / m:.4f}, "
-                    f"top-1 {stats['kd_top1_hits'] / m:.4f}, masa top-{args.k} {stats['kd_mass_sum'] / m:.4f}")
+                    f"top-1 {stats['kd_top1_hits'] / m:.4f} przy śr. p(top-1) {stats['kd_conf_sum'] / m:.4f}, "
+                    f"masa top-{args.k} {stats['kd_mass_sum'] / m:.4f}, "
+                    f"entropia {stats['kd_entropy_sum'] / m:.4f} nat")
         print(summary, flush=True)
         if args.benchmark:
             return
@@ -412,7 +428,7 @@ def finalize(args):
                            tokens=shard["tokens"], files=files))
         t = totals.setdefault(shard["split"], dict(positions=0, target_logp_sum=0.0, mass_sum=0.0, top1_hits=0,
                                                    kd_positions=0, kd_target_logp_sum=0.0, kd_mass_sum=0.0,
-                                                   kd_top1_hits=0))
+                                                   kd_top1_hits=0, kd_conf_sum=0.0, kd_entropy_sum=0.0))
         for key in t:
             t[key] += sum(p.get(key, 0) for p in parts)  # kd_* brak w starszych .done
     for split, t in totals.items():
@@ -423,9 +439,11 @@ def finalize(args):
         if t["kd_positions"]:
             m = t["kd_positions"]
             t.update(kd_teacher_nll=-t["kd_target_logp_sum"] / m, kd_top1=t["kd_top1_hits"] / m,
-                     kd_mass_mean=t["kd_mass_sum"] / m)
-            print(f"  tylko pozycje KD: {m:,}, NLL {t['kd_teacher_nll']:.4f}, top-1 {t['kd_top1']:.4f}, "
-                  f"masa top-{args.k} {t['kd_mass_mean']:.4f}")
+                     kd_mass_mean=t["kd_mass_sum"] / m, kd_top1_conf=t["kd_conf_sum"] / m,
+                     kd_entropy=t["kd_entropy_sum"] / m)
+            print(f"  tylko pozycje KD: {m:,}, NLL {t['kd_teacher_nll']:.4f}, top-1 {t['kd_top1']:.4f} "
+                  f"przy śr. p(top-1) {t['kd_top1_conf']:.4f}, masa top-{args.k} {t['kd_mass_mean']:.4f}, "
+                  f"entropia {t['kd_entropy']:.4f} nat")
     (out / "manifest.json").write_text(json.dumps(dict(
         format=FORMAT, k=args.k, model=parts[0]["model"], temperature=1.0,
         cache=str(cache), cache_manifest_sha256=cache_sha, seq_length=manifest["seq_length"],

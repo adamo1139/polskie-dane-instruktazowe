@@ -184,6 +184,20 @@ async def run(args, rows: list[dict], out_path: str) -> None:
         progress()
 
 
+# Pytania, przy których „tak” oznacza zaletę (przy pozostałych „tak” = problem).
+GOOD_IF_YES = {"dobry_przyklad_sft", "rozumowanie_sensowne"}
+
+
+def table(header: list[str], rows: list[list[str]], right: set[int]) -> str:
+    """Tabela z ramkami; kolumny o indeksach z `right` wyrównane do prawej."""
+    width = [max(len(str(x)) for x in col) for col in zip(header, *rows)]
+    cell = lambda r: "│ " + " │ ".join(str(x).rjust(w) if k in right else str(x).ljust(w)
+                                       for k, (x, w) in enumerate(zip(r, width))) + " │"
+    line = lambda a, b, c: a + b.join("─" * (w + 2) for w in width) + c
+    return "\n".join([line("┌", "┬", "┐"), cell(header), line("├", "┼", "┤"),
+                      *map(cell, rows), line("└", "┴", "┘")])
+
+
 def summarize(out_path: str) -> None:
     rows = {}
     with open(out_path, encoding="utf-8") as f:
@@ -192,16 +206,23 @@ def summarize(out_path: str) -> None:
             if r["id"] in rows and rows[r["id"]]["status"] == "scored":
                 continue  # nie nadpisuj udanej oceny późniejszym błędem
             rows[r["id"]] = r
-    print(f"\nrozmów: {len(rows)}  {dict(Counter(r['status'] for r in rows.values()))}")
+    status = Counter(r["status"] for r in rows.values())
+    print(f"\nrozmów: {len(rows)}  " + "  ".join(f"{k}: {v}" for k, v in status.items()))
     scores: dict[str, list[float]] = {}
     for r in rows.values():
         for k, v in r.get("basal", {}).items():
             scores.setdefault(k, []).append(v)
-    print("P(tak) na pytanie:      n    śr.   p10   p50   p90   >0,5")
+    body = []
     for k, v in scores.items():
         q = statistics.quantiles(v, n=10) if len(v) > 1 else v * 9
-        print(f"  {k:22} {len(v):6} {statistics.mean(v):.3f} {q[0]:.3f} {q[4]:.3f} {q[8]:.3f} "
-              f"{100 * sum(x > 0.5 for x in v) / len(v):5.1f}%")
+        good = k in GOOD_IF_YES
+        flagged = sum((x < 0.5) if good else (x > 0.5) for x in v)
+        body.append([k, "zaleta" if good else "problem", f"{len(v):,}", f"{statistics.mean(v):.3f}",
+                     f"{q[0]:.3f}", f"{q[4]:.3f}", f"{q[8]:.3f}", f"{flagged:,} ({100 * flagged / len(v):.1f}%)"])
+    if body:
+        print("P(tak) na pytanie; flaga = P > 0,5 przy problemie albo P < 0,5 przy zalecie")
+        print(table(["pytanie", "„tak” =", "rozmów", "śr.", "p10", "p50", "p90", "flaga"], body,
+                    right={2, 3, 4, 5, 6, 7}))
 
 
 def main() -> None:

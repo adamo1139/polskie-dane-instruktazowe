@@ -12,9 +12,10 @@ liczone na tym stanie:
 Skrypt tylko ocenia: zapisuje P(tak) na pytanie, bez progów i werdyktów — filtrowanie osobno.
 
 Wejście: sft.jsonl (id, messages[, meta]). Wyjście (w --out): scored.jsonl — id, liczba tur,
-thinking, basal {pytanie: P(tak)}, status (scored / za_dlugie / error), model; bez kopii rozmów
-(łączyć z sft.jsonl po id). Rozmowy dłuższe niż --max-chars nie są wysyłane (status "za_dlugie").
-Wznowienie = ten sam wiersz poleceń (statusy "error" i "za_dlugie" są sprawdzane od nowa).
+thinking, basal {pytanie: P(tak)}, status, model; bez kopii rozmów (łączyć z sft.jsonl po id).
+Status: scored; odrzucone — serwer odmówił (4xx, np. rozmowa dłuższa niż jego kontekst), bez ponowień;
+error — błąd przejściowy (5xx, timeout, połączenie) po --retries próbach.
+Wznowienie = ten sam wiersz poleceń (ponawiane są tylko rozmowy ze statusem error).
 
   python -m magpie.judge_conv --url http://192.168.1.26:6001-6008 \\
       --input data/polskie_sprawy_v8/sft.jsonl --out data/judge_v8 --limit 1000
@@ -107,8 +108,6 @@ async def ask(session, limiter, args, row, stats, widx) -> dict:
     base = {"id": row["id"], "turns": sum(m["role"] == "user" for m in row["messages"]),
             "thinking": (row.get("meta") or {}).get("thinking")}
     request = build_request(row, args.with_reasoning)
-    if args.max_chars and len(request["state"]) > args.max_chars:
-        return {**base, "status": "za_dlugie", "chars": len(request["state"])}
     last_err = None
     for attempt in range(args.retries + 1):
         url = args.urls[(widx + attempt) % len(args.urls)]
@@ -117,6 +116,11 @@ async def ask(session, limiter, args, row, stats, widx) -> dict:
         try:
             async with asyncio.timeout(args.timeout):
                 async with session.post(f"{url}/v1/systemone", json=request) as resp:
+                    if 400 <= resp.status < 500:
+                        # Odmowa serwera (np. za długa rozmowa) nie zmieni się przy ponowieniu.
+                        stats[url] += 1
+                        return {**base, "status": "odrzucone", "chars": len(request["state"]),
+                                "error": f"HTTP {resp.status}: {(await resp.text())[:300]}"}
                     if resp.status != 200:
                         raise RuntimeError(f"HTTP {resp.status}: {(await resp.text())[:200]}")
                     body = await resp.json()
@@ -155,7 +159,7 @@ async def run(args, rows: list[dict], out_path: str) -> None:
     def progress() -> None:
         n = stats["done"]
         rate = n / max(time.monotonic() - t0, 1e-9)
-        print(f"{n}/{len(rows)}  ocenione {stats['scored']}  za długie {stats['za_dlugie']}  "
+        print(f"{n}/{len(rows)}  ocenione {stats['scored']}  odrzucone {stats['odrzucone']}  "
               f"błędy {stats['error']}  timeouty {stats['timeout']}  "
               f"{rate:.1f} rozm/s  ETA {(len(rows) - n) / max(rate, 1e-9) / 60:.0f} min", flush=True)
 
@@ -203,8 +207,8 @@ def summarize(out_path: str) -> None:
     with open(out_path, encoding="utf-8") as f:
         for line in f:
             r = json.loads(line)
-            if r["id"] in rows and rows[r["id"]]["status"] == "scored":
-                continue  # nie nadpisuj udanej oceny późniejszym błędem
+            if r["id"] in rows and rows[r["id"]]["status"] != "error":
+                continue  # nie nadpisuj wyniku późniejszym błędem
             rows[r["id"]] = r
     status = Counter(r["status"] for r in rows.values())
     print(f"\nrozmów: {len(rows)}  " + "  ".join(f"{k}: {v}" for k, v in status.items()))
@@ -234,7 +238,6 @@ def main() -> None:
     p.add_argument("--limit", type=int, default=0, help="tylko pierwsze N rozmów (0 = wszystkie)")
     p.add_argument("--without-reasoning", dest="with_reasoning", action="store_false",
                    help="pomiń rozumowanie asystenta (wtedy bez pytania rozumowanie_sensowne)")
-    p.add_argument("--max-chars", type=int, default=30000, help="dłuższych stanów nie wysyłaj (0 = bez limitu)")
     p.add_argument("--concurrency", type=int, default=200)
     p.add_argument("--rate", type=float, default=10000, help="maks. startów zapytań na sekundę")
     p.add_argument("--timeout", type=float, default=120, help="limit na jedno zapytanie (s)")
@@ -263,12 +266,11 @@ def main() -> None:
     done: set = set()
     if os.path.exists(out_path):
         with open(out_path, encoding="utf-8") as f:
-            # za_dlugie też od nowa: po zmianie --max-chars mogą się już zmieścić.
-            done = {r["id"] for r in map(json.loads, f) if r["status"] == "scored"}
+            done = {r["id"] for r in map(json.loads, f) if r["status"] != "error"}
     todo = [r for r in rows if r["id"] not in done]
     print(f"rozmów: {len(rows)}, ocenionych: {len(done)}, do zrobienia: {len(todo)}  (instancje {len(args.urls)}, "
           f"concurrency {args.concurrency}, timeout {args.timeout}s, "
-          f"rozumowanie {'tak' if args.with_reasoning else 'nie'}, max {args.max_chars} znaków)", flush=True)
+          f"rozumowanie {'tak' if args.with_reasoning else 'nie'})", flush=True)
     if todo:
         asyncio.run(run(args, todo, out_path))
     summarize(out_path)

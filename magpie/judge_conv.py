@@ -1,11 +1,15 @@
 """Ocena całych rozmów SFT modelem basal (basal-serve, endpoint /v1/systemone).
 
 Każda rozmowa (np. z polskie-sprawy-v8) = jeden stan z całą treścią (wszystkie tury użytkownika
-i asystenta; rozumowanie tylko z --with-reasoning) i dwa pytania tak/nie liczone na tym stanie:
-  halucynacje        — czy odpowiedzi asystenta zawierają nieprawdziwe lub zmyślone informacje
-                       (dobra rozmowa: nie),
-  dobry_przyklad_sft — czy rozmowa jest dobrym przykładem do treningu imitacyjnego SFT (dobra: tak).
-Rozmowa przechodzi, gdy dla obu P(oczekiwanej odpowiedzi) >= --threshold (domyślnie 0.7).
+i asystenta, razem z rozumowaniem asystenta; --without-reasoning je pomija) i pytania tak/nie
+liczone na tym stanie:
+  halucynacje           — czy odpowiedzi asystenta zawierają nieprawdziwe lub zmyślone informacje
+                          (dobra rozmowa: nie),
+  dobry_przyklad_sft    — czy rozmowa jest dobrym przykładem do treningu imitacyjnego SFT (dobra: tak),
+  rozumowanie_sensowne  — tylko gdy rozmowa ma rozumowanie (i jest w stanie): czy jest sensowne
+                          (dobra: tak).
+Rozmowa przechodzi, gdy dla każdego zadanego pytania P(oczekiwanej odpowiedzi) >= --threshold
+(domyślnie 0.7).
 
 Wejście: sft.jsonl (id, messages[, meta]). Wyjście (w --out): scored.jsonl — tylko id, P(tak) na
 pytanie, failed, verdict, model; bez kopii rozmów (łączyć z sft.jsonl po id). Rozmowy dłuższe niż
@@ -37,6 +41,13 @@ CHECKS = {
         "instructions": "Czy ta rozmowa jest dobrym przykładem do treningu imitacyjnego SFT polskiego asystenta?",
     },
 }
+# Zadawane tylko rozmowom z rozumowaniem (gdy rozumowanie jest w stanie).
+REASONING_CHECK = {
+    "rozumowanie_sensowne": {
+        "want": True,
+        "instructions": "Czy rozumowanie asystenta jest sensowne?",
+    },
+}
 
 STATE_INTRO = (
     "Budujemy zbiór danych do treningu imitacyjnego SFT polskiego asystenta AI (czatbota): model uczy się "
@@ -46,6 +57,11 @@ STATE_INTRO = (
     "na temat pytania, poprawną polszczyzną i w formie, jakiej chcielibyśmy uczyć model. Zły przykład "
     "to rozmowa z błędami merytorycznymi lub zmyślonymi faktami, z odpowiedzią nie na temat, urwaną, "
     "powtarzającą się, niezrozumiałą, w złym języku albo z odmową bez powodu.\n\n"
+)
+REASONING_INTRO = (
+    "Przed odpowiedzią asystent czasem rozumuje (fragment oznaczony jako rozumowanie asystenta); model "
+    "uczy się także tego rozumowania. Sensowne rozumowanie jest logiczne, dotyczy pytania, prowadzi do "
+    "udzielonej odpowiedzi i nie zawiera zapętleń, powtórzeń ani wewnętrznych sprzeczności.\n\n"
 )
 ROLES = {"user": "Użytkownik", "assistant": "Asystent", "system": "System"}
 
@@ -60,16 +76,23 @@ def render(row: dict, with_reasoning: bool) -> str:
     return "\n\n".join(parts)
 
 
+def checks_for(row: dict, with_reasoning: bool) -> dict:
+    has_reasoning = with_reasoning and any(m.get("reasoning_content") for m in row["messages"])
+    return {**CHECKS, **REASONING_CHECK} if has_reasoning else CHECKS
+
+
 def build_request(row: dict, with_reasoning: bool) -> dict:
+    checks = checks_for(row, with_reasoning)
+    intro = STATE_INTRO + (REASONING_INTRO if "rozumowanie_sensowne" in checks else "")
     return {
-        "state": STATE_INTRO + f"Rozmowa:\n\"\"\"\n{render(row, with_reasoning)}\n\"\"\"",
-        "questions": {k: {"type": "noul", "instructions": c["instructions"]} for k, c in CHECKS.items()},
+        "state": intro + f"Rozmowa:\n\"\"\"\n{render(row, with_reasoning)}\n\"\"\"",
+        "questions": {k: {"type": "noul", "instructions": c["instructions"]} for k, c in checks.items()},
     }
 
 
-def judge(answers: dict, threshold: float) -> tuple[dict, list[str]]:
-    scores = {k: round(p_true(answers[k]), 4) for k in CHECKS}
-    failed = [k for k, c in CHECKS.items() if (scores[k] if c["want"] else 1 - scores[k]) < threshold]
+def judge(answers: dict, checks: dict, threshold: float) -> tuple[dict, list[str]]:
+    scores = {k: round(p_true(answers[k]), 4) for k in checks}
+    failed = [k for k, c in checks.items() if (scores[k] if c["want"] else 1 - scores[k]) < threshold]
     return scores, failed
 
 
@@ -90,7 +113,7 @@ async def ask(session, limiter, args, row, stats, widx) -> dict:
                     if resp.status != 200:
                         raise RuntimeError(f"HTTP {resp.status}: {(await resp.text())[:200]}")
                     body = await resp.json()
-            scores, failed = judge(body["answers"], args.threshold)
+            scores, failed = judge(body["answers"], checks_for(row, args.with_reasoning), args.threshold)
             stats[url] += 1
             return {**base, "basal": scores, "failed": failed, "verdict": "ok" if not failed else "fail",
                     "basal_model": body.get("model"), "chars": len(request["state"])}
@@ -179,7 +202,8 @@ def main() -> None:
     p.add_argument("--out", required=True, help="katalog wynikowy")
     p.add_argument("--limit", type=int, default=0, help="tylko pierwsze N rozmów (0 = wszystkie)")
     p.add_argument("--threshold", type=float, default=0.7, help="min. P(oczekiwanej odpowiedzi) na pytanie")
-    p.add_argument("--with-reasoning", action="store_true", help="dołącz rozumowanie asystenta do stanu")
+    p.add_argument("--without-reasoning", dest="with_reasoning", action="store_false",
+                   help="pomiń rozumowanie asystenta (wtedy bez pytania rozumowanie_sensowne)")
     p.add_argument("--max-chars", type=int, default=30000, help="dłuższych stanów nie wysyłaj (0 = bez limitu)")
     p.add_argument("--concurrency", type=int, default=200)
     p.add_argument("--rate", type=float, default=10000, help="maks. startów zapytań na sekundę")

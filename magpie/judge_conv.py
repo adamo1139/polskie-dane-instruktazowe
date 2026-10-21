@@ -1,0 +1,223 @@
+"""Ocena całych rozmów SFT modelem basal (basal-serve, endpoint /v1/systemone).
+
+Każda rozmowa (np. z polskie-sprawy-v8) = jeden stan z całą treścią (wszystkie tury użytkownika
+i asystenta; rozumowanie tylko z --with-reasoning) i dwa pytania tak/nie liczone na tym stanie:
+  halucynacje        — czy odpowiedzi asystenta zawierają nieprawdziwe lub zmyślone informacje
+                       (dobra rozmowa: nie),
+  dobry_przyklad_sft — czy rozmowa jest dobrym przykładem do treningu imitacyjnego SFT (dobra: tak).
+Rozmowa przechodzi, gdy dla obu P(oczekiwanej odpowiedzi) >= --threshold (domyślnie 0.7).
+
+Wejście: sft.jsonl (id, messages[, meta]). Wyjście (w --out): scored.jsonl — tylko id, P(tak) na
+pytanie, failed, verdict, model; bez kopii rozmów (łączyć z sft.jsonl po id). Rozmowy dłuższe niż
+--max-chars nie są wysyłane (verdict "za_dlugie"). Wznowienie = ten sam wiersz poleceń.
+
+  python -m magpie.judge_conv --url http://192.168.1.26:6001-6008 \\
+      --input data/polskie_sprawy_v8/sft.jsonl --out data/judge_v8 --limit 1000
+"""
+import argparse
+import asyncio
+import json
+import os
+import time
+from collections import Counter
+
+import aiohttp
+from aiolimiter import AsyncLimiter
+
+from .verify import p_true, parse_urls
+
+CHECKS = {
+    "halucynacje": {
+        "want": False,
+        "instructions": "Czy odpowiedzi asystenta zawierają nieprawdziwe informacje albo zmyślone fakty, "
+                        "nazwy, liczby, cytaty lub źródła?",
+    },
+    "dobry_przyklad_sft": {
+        "want": True,
+        "instructions": "Czy ta rozmowa jest dobrym przykładem do treningu imitacyjnego SFT polskiego asystenta?",
+    },
+}
+
+STATE_INTRO = (
+    "Budujemy zbiór danych do treningu imitacyjnego SFT polskiego asystenta AI (czatbota): model uczy się "
+    "odpowiadać dokładnie tak, jak asystent w poniższej rozmowie. Oceniamy, czy ta rozmowa nadaje się "
+    "do takiego zbioru.\n\n"
+    "Dobry przykład to rozmowa, w której asystent odpowiada zgodnie z prawdą, rzeczowo i pomocnie, "
+    "na temat pytania, poprawną polszczyzną i w formie, jakiej chcielibyśmy uczyć model. Zły przykład "
+    "to rozmowa z błędami merytorycznymi lub zmyślonymi faktami, z odpowiedzią nie na temat, urwaną, "
+    "powtarzającą się, niezrozumiałą, w złym języku albo z odmową bez powodu.\n\n"
+)
+ROLES = {"user": "Użytkownik", "assistant": "Asystent", "system": "System"}
+
+
+def render(row: dict, with_reasoning: bool) -> str:
+    parts = []
+    for m in row["messages"]:
+        text = m["content"]
+        if with_reasoning and m.get("reasoning_content"):
+            text = f"(rozumowanie asystenta)\n{m['reasoning_content']}\n(odpowiedź)\n{text}"
+        parts.append(f"[{ROLES.get(m['role'], m['role'])}]\n{text}")
+    return "\n\n".join(parts)
+
+
+def build_request(row: dict, with_reasoning: bool) -> dict:
+    return {
+        "state": STATE_INTRO + f"Rozmowa:\n\"\"\"\n{render(row, with_reasoning)}\n\"\"\"",
+        "questions": {k: {"type": "noul", "instructions": c["instructions"]} for k, c in CHECKS.items()},
+    }
+
+
+def judge(answers: dict, threshold: float) -> tuple[dict, list[str]]:
+    scores = {k: round(p_true(answers[k]), 4) for k in CHECKS}
+    failed = [k for k, c in CHECKS.items() if (scores[k] if c["want"] else 1 - scores[k]) < threshold]
+    return scores, failed
+
+
+async def ask(session, limiter, args, row, stats, widx) -> dict:
+    base = {"id": row["id"], "turns": sum(m["role"] == "user" for m in row["messages"]),
+            "thinking": (row.get("meta") or {}).get("thinking")}
+    request = build_request(row, args.with_reasoning)
+    if args.max_chars and len(request["state"]) > args.max_chars:
+        return {**base, "verdict": "za_dlugie", "chars": len(request["state"])}
+    last_err = None
+    for attempt in range(args.retries + 1):
+        url = args.urls[(widx + attempt) % len(args.urls)]
+        async with limiter:
+            pass
+        try:
+            async with asyncio.timeout(args.timeout):
+                async with session.post(f"{url}/v1/systemone", json=request) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"HTTP {resp.status}: {(await resp.text())[:200]}")
+                    body = await resp.json()
+            scores, failed = judge(body["answers"], args.threshold)
+            stats[url] += 1
+            return {**base, "basal": scores, "failed": failed, "verdict": "ok" if not failed else "fail",
+                    "basal_model": body.get("model"), "chars": len(request["state"])}
+        except TimeoutError:
+            stats["timeout"] += 1
+            last_err = f"timeout > {args.timeout}s"
+        except (aiohttp.ClientError, RuntimeError, KeyError, ValueError) as e:
+            stats["http_err"] += 1
+            last_err = repr(e)[:200]
+        if attempt < args.retries:
+            await asyncio.sleep(2 * (attempt + 1))
+    return {**base, "verdict": "error", "error": last_err}
+
+
+async def run(args, rows: list[dict], out_path: str) -> None:
+    queue: asyncio.Queue = asyncio.Queue()
+    for r in rows:
+        queue.put_nowait(r)
+    limiter = AsyncLimiter(args.rate, 1)
+    stats: Counter = Counter()
+    buffer: list[dict] = []
+    t0 = time.monotonic()
+    fout = open(out_path, "a", encoding="utf-8")
+
+    def flush() -> None:
+        if buffer:
+            fout.write("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in buffer))
+            fout.flush()
+            os.fsync(fout.fileno())
+            buffer.clear()
+
+    def progress() -> None:
+        n = stats["done"]
+        rate = n / max(time.monotonic() - t0, 1e-9)
+        print(f"{n}/{len(rows)}  ok {stats['ok']} ({100 * stats['ok'] / max(n, 1):.0f}%)  fail {stats['fail']}  "
+              f"za długie {stats['za_dlugie']}  błędy {stats['error']}  timeouty {stats['timeout']}  "
+              f"{rate:.1f} rozm/s  ETA {(len(rows) - n) / max(rate, 1e-9) / 60:.0f} min", flush=True)
+
+    async def worker(session, widx: int) -> None:
+        while True:
+            try:
+                row = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            res = await ask(session, limiter, args, row, stats, widx)
+            stats["done"] += 1
+            stats[res["verdict"]] += 1
+            buffer.append(res)
+            if len(buffer) >= args.flush_every:
+                flush()
+            if stats["done"] % args.progress_every == 0:
+                progress()
+
+    connector = aiohttp.TCPConnector(limit=args.concurrency, limit_per_host=args.concurrency)
+    try:
+        async with aiohttp.ClientSession(connector=connector) as session:
+            await asyncio.gather(*(worker(session, i) for i in range(min(args.concurrency, len(rows)))))
+    finally:
+        flush()
+        fout.close()
+        progress()
+
+
+def summarize(out_path: str) -> None:
+    rows = {}
+    with open(out_path, encoding="utf-8") as f:
+        for line in f:
+            r = json.loads(line)
+            if r["id"] in rows and r["verdict"] == "error":
+                continue
+            rows[r["id"]] = r
+    print(f"\nocenionych: {len(rows)}  {dict(Counter(r['verdict'] for r in rows.values()))}")
+    print("niezaliczone pytania:", dict(Counter(k for r in rows.values() for k in r.get("failed", []))))
+    by = Counter((r.get("thinking"), r.get("turns"), r["verdict"]) for r in rows.values())
+    for key in sorted({(t, n) for t, n, _ in by}, key=str):
+        ok, n = by[(*key, "ok")], sum(by[(*key, v)] for v in ("ok", "fail"))
+        if n:
+            print(f"  thinking={key[0]} tur={key[1]}: ok {ok}/{n} ({100 * ok / n:.0f}%)")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--url", default="http://192.168.1.26:6001-6008",
+                   help="adres(y) basal-serve bez /v1: lista po przecinku lub zakres portów host:6001-6008")
+    p.add_argument("--input", required=True, help="sft.jsonl z rozmowami (id, messages)")
+    p.add_argument("--out", required=True, help="katalog wynikowy")
+    p.add_argument("--limit", type=int, default=0, help="tylko pierwsze N rozmów (0 = wszystkie)")
+    p.add_argument("--threshold", type=float, default=0.7, help="min. P(oczekiwanej odpowiedzi) na pytanie")
+    p.add_argument("--with-reasoning", action="store_true", help="dołącz rozumowanie asystenta do stanu")
+    p.add_argument("--max-chars", type=int, default=30000, help="dłuższych stanów nie wysyłaj (0 = bez limitu)")
+    p.add_argument("--concurrency", type=int, default=200)
+    p.add_argument("--rate", type=float, default=10000, help="maks. startów zapytań na sekundę")
+    p.add_argument("--timeout", type=float, default=120, help="limit na jedno zapytanie (s)")
+    p.add_argument("--retries", type=int, default=2)
+    p.add_argument("--flush-every", type=int, default=100)
+    p.add_argument("--progress-every", type=int, default=500)
+    p.add_argument("--dry-run", action="store_true", help="wypisz zapytanie dla pierwszej rozmowy i wyjdź")
+    p.add_argument("--summary-only", action="store_true")
+    args = p.parse_args()
+    args.urls = parse_urls(args.url)
+
+    os.makedirs(args.out, exist_ok=True)
+    out_path = os.path.join(args.out, "scored.jsonl")
+    if args.summary_only:
+        summarize(out_path)
+        return
+    rows = []
+    with open(args.input, encoding="utf-8") as f:
+        for line in f:
+            rows.append(json.loads(line))
+            if args.limit and len(rows) >= args.limit:
+                break
+    if args.dry_run:
+        print(json.dumps(build_request(rows[0], args.with_reasoning), ensure_ascii=False, indent=2))
+        return
+    done: set = set()
+    if os.path.exists(out_path):
+        with open(out_path, encoding="utf-8") as f:
+            done = {r["id"] for r in map(json.loads, f) if r["verdict"] != "error"}
+    todo = [r for r in rows if r["id"] not in done]
+    print(f"rozmów: {len(rows)}, ocenionych: {len(done)}, do zrobienia: {len(todo)}  (instancje {len(args.urls)}, "
+          f"concurrency {args.concurrency}, timeout {args.timeout}s, próg {args.threshold}, "
+          f"rozumowanie {'tak' if args.with_reasoning else 'nie'}, max {args.max_chars} znaków)", flush=True)
+    if todo:
+        asyncio.run(run(args, todo, out_path))
+    summarize(out_path)
+
+
+if __name__ == "__main__":
+    main()

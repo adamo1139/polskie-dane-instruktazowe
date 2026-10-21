@@ -3,20 +3,18 @@
 Każda rozmowa (np. z polskie-sprawy-v8) = jeden stan z całą treścią (wszystkie tury użytkownika
 i asystenta, razem z rozumowaniem asystenta; --without-reasoning je pomija) i pytania tak/nie
 liczone na tym stanie:
-  halucynacje           — czy odpowiedzi asystenta zawierają nieprawdziwe lub zmyślone informacje
-                          (dobra rozmowa: nie),
-  dobry_przyklad_sft    — czy rozmowa jest dobrym przykładem do treningu imitacyjnego SFT (dobra: tak),
-  rozumowanie_sensowne  — tylko gdy rozmowa ma rozumowanie (i jest w stanie): czy jest sensowne
-                          (dobra: tak),
+  halucynacje           — czy odpowiedzi asystenta zawierają nieprawdziwe lub zmyślone informacje,
+  dobry_przyklad_sft    — czy rozmowa jest dobrym przykładem do treningu imitacyjnego SFT,
+  rozumowanie_sensowne  — tylko gdy rozmowa ma rozumowanie (i jest w stanie): czy jest sensowne,
   powtorzone_pytania    — tylko rozmowy wieloturowe: czy druga i kolejne wiadomości użytkownika
-                          mają bardzo podobną treść do pierwszej (dobra: nie),
-  powtorzone_odpowiedzi — tylko rozmowy wieloturowe: to samo dla odpowiedzi asystenta (dobra: nie).
-Rozmowa przechodzi, gdy dla każdego zadanego pytania P(oczekiwanej odpowiedzi) >= --threshold
-(domyślnie 0.7).
+                          mają bardzo podobną treść do pierwszej,
+  powtorzone_odpowiedzi — tylko rozmowy wieloturowe: to samo dla odpowiedzi asystenta.
+Skrypt tylko ocenia: zapisuje P(tak) na pytanie, bez progów i werdyktów — filtrowanie osobno.
 
-Wejście: sft.jsonl (id, messages[, meta]). Wyjście (w --out): scored.jsonl — tylko id, P(tak) na
-pytanie, failed, verdict, model; bez kopii rozmów (łączyć z sft.jsonl po id). Rozmowy dłuższe niż
---max-chars nie są wysyłane (verdict "za_dlugie"). Wznowienie = ten sam wiersz poleceń.
+Wejście: sft.jsonl (id, messages[, meta]). Wyjście (w --out): scored.jsonl — id, liczba tur,
+thinking, basal {pytanie: P(tak)}, status (scored / za_dlugie / error), model; bez kopii rozmów
+(łączyć z sft.jsonl po id). Rozmowy dłuższe niż --max-chars nie są wysyłane (status "za_dlugie").
+Wznowienie = ten sam wiersz poleceń (statusy "error" i "za_dlugie" są sprawdzane od nowa).
 
   python -m magpie.judge_conv --url http://192.168.1.26:6001-6008 \\
       --input data/polskie_sprawy_v8/sft.jsonl --out data/judge_v8 --limit 1000
@@ -25,6 +23,7 @@ import argparse
 import asyncio
 import json
 import os
+import statistics
 import time
 from collections import Counter
 
@@ -35,24 +34,20 @@ from .verify import p_true, parse_urls
 
 CHECKS = {
     "halucynacje": {
-        "want": False,
         "instructions": "Czy odpowiedzi asystenta zawierają nieprawdziwe informacje albo zmyślone fakty, "
                         "nazwy, liczby, cytaty lub źródła?",
     },
     "dobry_przyklad_sft": {
-        "want": True,
         "instructions": "Czy ta rozmowa jest dobrym przykładem do treningu imitacyjnego SFT polskiego asystenta?",
     },
 }
 # Zadawane tylko rozmowom z co najmniej dwiema turami użytkownika.
 MULTITURN_CHECKS = {
     "powtorzone_pytania": {
-        "want": False,
         "instructions": "Czy druga i kolejne wiadomości użytkownika mają bardzo podobną treść do jego "
                         "pierwszej wiadomości?",
     },
     "powtorzone_odpowiedzi": {
-        "want": False,
         "instructions": "Czy druga i kolejne odpowiedzi asystenta mają bardzo podobną treść do jego "
                         "pierwszej odpowiedzi?",
     },
@@ -60,7 +55,6 @@ MULTITURN_CHECKS = {
 # Zadawane tylko rozmowom z rozumowaniem (gdy rozumowanie jest w stanie).
 REASONING_CHECK = {
     "rozumowanie_sensowne": {
-        "want": True,
         "instructions": "Czy rozumowanie asystenta jest sensowne?",
     },
 }
@@ -107,10 +101,6 @@ def build_request(row: dict, with_reasoning: bool) -> dict:
     }
 
 
-def judge(answers: dict, checks: dict, threshold: float) -> tuple[dict, list[str]]:
-    scores = {k: round(p_true(answers[k]), 4) for k in checks}
-    failed = [k for k, c in checks.items() if (scores[k] if c["want"] else 1 - scores[k]) < threshold]
-    return scores, failed
 
 
 async def ask(session, limiter, args, row, stats, widx) -> dict:
@@ -118,7 +108,7 @@ async def ask(session, limiter, args, row, stats, widx) -> dict:
             "thinking": (row.get("meta") or {}).get("thinking")}
     request = build_request(row, args.with_reasoning)
     if args.max_chars and len(request["state"]) > args.max_chars:
-        return {**base, "verdict": "za_dlugie", "chars": len(request["state"])}
+        return {**base, "status": "za_dlugie", "chars": len(request["state"])}
     last_err = None
     for attempt in range(args.retries + 1):
         url = args.urls[(widx + attempt) % len(args.urls)]
@@ -130,10 +120,10 @@ async def ask(session, limiter, args, row, stats, widx) -> dict:
                     if resp.status != 200:
                         raise RuntimeError(f"HTTP {resp.status}: {(await resp.text())[:200]}")
                     body = await resp.json()
-            scores, failed = judge(body["answers"], checks_for(row, args.with_reasoning), args.threshold)
+            scores = {k: round(p_true(body["answers"][k]), 4) for k in request["questions"]}
             stats[url] += 1
-            return {**base, "basal": scores, "failed": failed, "verdict": "ok" if not failed else "fail",
-                    "basal_model": body.get("model"), "chars": len(request["state"])}
+            return {**base, "basal": scores, "status": "scored", "basal_model": body.get("model"),
+                    "chars": len(request["state"])}
         except TimeoutError:
             stats["timeout"] += 1
             last_err = f"timeout > {args.timeout}s"
@@ -142,7 +132,7 @@ async def ask(session, limiter, args, row, stats, widx) -> dict:
             last_err = repr(e)[:200]
         if attempt < args.retries:
             await asyncio.sleep(2 * (attempt + 1))
-    return {**base, "verdict": "error", "error": last_err}
+    return {**base, "status": "error", "error": last_err}
 
 
 async def run(args, rows: list[dict], out_path: str) -> None:
@@ -165,8 +155,8 @@ async def run(args, rows: list[dict], out_path: str) -> None:
     def progress() -> None:
         n = stats["done"]
         rate = n / max(time.monotonic() - t0, 1e-9)
-        print(f"{n}/{len(rows)}  ok {stats['ok']} ({100 * stats['ok'] / max(n, 1):.0f}%)  fail {stats['fail']}  "
-              f"za długie {stats['za_dlugie']}  błędy {stats['error']}  timeouty {stats['timeout']}  "
+        print(f"{n}/{len(rows)}  ocenione {stats['scored']}  za długie {stats['za_dlugie']}  "
+              f"błędy {stats['error']}  timeouty {stats['timeout']}  "
               f"{rate:.1f} rozm/s  ETA {(len(rows) - n) / max(rate, 1e-9) / 60:.0f} min", flush=True)
 
     async def worker(session, widx: int) -> None:
@@ -177,7 +167,7 @@ async def run(args, rows: list[dict], out_path: str) -> None:
                 return
             res = await ask(session, limiter, args, row, stats, widx)
             stats["done"] += 1
-            stats[res["verdict"]] += 1
+            stats[res["status"]] += 1
             buffer.append(res)
             if len(buffer) >= args.flush_every:
                 flush()
@@ -199,16 +189,19 @@ def summarize(out_path: str) -> None:
     with open(out_path, encoding="utf-8") as f:
         for line in f:
             r = json.loads(line)
-            if r["id"] in rows and r["verdict"] == "error":
-                continue
+            if r["id"] in rows and rows[r["id"]]["status"] == "scored":
+                continue  # nie nadpisuj udanej oceny późniejszym błędem
             rows[r["id"]] = r
-    print(f"\nocenionych: {len(rows)}  {dict(Counter(r['verdict'] for r in rows.values()))}")
-    print("niezaliczone pytania:", dict(Counter(k for r in rows.values() for k in r.get("failed", []))))
-    by = Counter((r.get("thinking"), r.get("turns"), r["verdict"]) for r in rows.values())
-    for key in sorted({(t, n) for t, n, _ in by}, key=str):
-        ok, n = by[(*key, "ok")], sum(by[(*key, v)] for v in ("ok", "fail"))
-        if n:
-            print(f"  thinking={key[0]} tur={key[1]}: ok {ok}/{n} ({100 * ok / n:.0f}%)")
+    print(f"\nrozmów: {len(rows)}  {dict(Counter(r['status'] for r in rows.values()))}")
+    scores: dict[str, list[float]] = {}
+    for r in rows.values():
+        for k, v in r.get("basal", {}).items():
+            scores.setdefault(k, []).append(v)
+    print("P(tak) na pytanie:      n    śr.   p10   p50   p90   >0,5")
+    for k, v in scores.items():
+        q = statistics.quantiles(v, n=10) if len(v) > 1 else v * 9
+        print(f"  {k:22} {len(v):6} {statistics.mean(v):.3f} {q[0]:.3f} {q[4]:.3f} {q[8]:.3f} "
+              f"{100 * sum(x > 0.5 for x in v) / len(v):5.1f}%")
 
 
 def main() -> None:
@@ -218,7 +211,6 @@ def main() -> None:
     p.add_argument("--input", required=True, help="sft.jsonl z rozmowami (id, messages)")
     p.add_argument("--out", required=True, help="katalog wynikowy")
     p.add_argument("--limit", type=int, default=0, help="tylko pierwsze N rozmów (0 = wszystkie)")
-    p.add_argument("--threshold", type=float, default=0.7, help="min. P(oczekiwanej odpowiedzi) na pytanie")
     p.add_argument("--without-reasoning", dest="with_reasoning", action="store_false",
                    help="pomiń rozumowanie asystenta (wtedy bez pytania rozumowanie_sensowne)")
     p.add_argument("--max-chars", type=int, default=30000, help="dłuższych stanów nie wysyłaj (0 = bez limitu)")
@@ -250,10 +242,11 @@ def main() -> None:
     done: set = set()
     if os.path.exists(out_path):
         with open(out_path, encoding="utf-8") as f:
-            done = {r["id"] for r in map(json.loads, f) if r["verdict"] != "error"}
+            # za_dlugie też od nowa: po zmianie --max-chars mogą się już zmieścić.
+            done = {r["id"] for r in map(json.loads, f) if r["status"] == "scored"}
     todo = [r for r in rows if r["id"] not in done]
     print(f"rozmów: {len(rows)}, ocenionych: {len(done)}, do zrobienia: {len(todo)}  (instancje {len(args.urls)}, "
-          f"concurrency {args.concurrency}, timeout {args.timeout}s, próg {args.threshold}, "
+          f"concurrency {args.concurrency}, timeout {args.timeout}s, "
           f"rozumowanie {'tak' if args.with_reasoning else 'nie'}, max {args.max_chars} znaków)", flush=True)
     if todo:
         asyncio.run(run(args, todo, out_path))

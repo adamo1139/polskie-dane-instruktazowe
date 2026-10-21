@@ -7,7 +7,10 @@ liczone na tym stanie:
                           (dobra rozmowa: nie),
   dobry_przyklad_sft    — czy rozmowa jest dobrym przykładem do treningu imitacyjnego SFT (dobra: tak),
   rozumowanie_sensowne  — tylko gdy rozmowa ma rozumowanie (i jest w stanie): czy jest sensowne
-                          (dobra: tak).
+                          (dobra: tak),
+  powtorzone_pytania    — tylko rozmowy wieloturowe: czy druga i kolejne wiadomości użytkownika
+                          mają bardzo podobną treść do pierwszej (dobra: nie),
+  powtorzone_odpowiedzi — tylko rozmowy wieloturowe: to samo dla odpowiedzi asystenta (dobra: nie).
 Rozmowa przechodzi, gdy dla każdego zadanego pytania P(oczekiwanej odpowiedzi) >= --threshold
 (domyślnie 0.7).
 
@@ -39,6 +42,19 @@ CHECKS = {
     "dobry_przyklad_sft": {
         "want": True,
         "instructions": "Czy ta rozmowa jest dobrym przykładem do treningu imitacyjnego SFT polskiego asystenta?",
+    },
+}
+# Zadawane tylko rozmowom z co najmniej dwiema turami użytkownika.
+MULTITURN_CHECKS = {
+    "powtorzone_pytania": {
+        "want": False,
+        "instructions": "Czy druga i kolejne wiadomości użytkownika mają bardzo podobną treść do jego "
+                        "pierwszej wiadomości?",
+    },
+    "powtorzone_odpowiedzi": {
+        "want": False,
+        "instructions": "Czy druga i kolejne odpowiedzi asystenta mają bardzo podobną treść do jego "
+                        "pierwszej odpowiedzi?",
     },
 }
 # Zadawane tylko rozmowom z rozumowaniem (gdy rozumowanie jest w stanie).
@@ -78,7 +94,8 @@ def render(row: dict, with_reasoning: bool) -> str:
 
 def checks_for(row: dict, with_reasoning: bool) -> dict:
     has_reasoning = with_reasoning and any(m.get("reasoning_content") for m in row["messages"])
-    return {**CHECKS, **REASONING_CHECK} if has_reasoning else CHECKS
+    multiturn = sum(m["role"] == "user" for m in row["messages"]) >= 2
+    return {**CHECKS, **(REASONING_CHECK if has_reasoning else {}), **(MULTITURN_CHECKS if multiturn else {})}
 
 
 def build_request(row: dict, with_reasoning: bool) -> dict:
